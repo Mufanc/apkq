@@ -61,8 +61,6 @@ struct OutputLocation {
     kind: char,
     location: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mapped_location: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     source_file: Option<String>,
 }
 
@@ -96,32 +94,16 @@ fn run(cli: Cli) -> Result<(), String> {
     } else if output.is_empty() {
         println!("No matches.");
     } else {
-        if mapping.is_some() {
-            println!("APK/DEX\tKIND\tLOCATION\tMAPPED_LOCATION\tSOURCE");
-        } else {
-            println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
-        }
+        println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
         for location in output {
-            if mapping.is_some() {
-                println!(
-                    "{}!{}\t{}\t{}\t{}\t{}",
-                    location.apk,
-                    location.dex,
-                    location.kind,
-                    location.location,
-                    location.mapped_location.as_deref().unwrap_or_default(),
-                    location.source_file.as_deref().unwrap_or_default()
-                );
-            } else {
-                println!(
-                    "{}!{}\t{}\t{}\t{}",
-                    location.apk,
-                    location.dex,
-                    location.kind,
-                    location.location,
-                    location.source_file.as_deref().unwrap_or_default()
-                );
-            }
+            println!(
+                "{}!{}\t{}\t{}\t{}",
+                location.apk,
+                location.dex,
+                location.kind,
+                location.location,
+                location.source_file.as_deref().unwrap_or_default()
+            );
         }
     }
     Ok(())
@@ -178,6 +160,10 @@ fn query_apk(
     let mut output = Vec::new();
     for method_id in method_ids {
         let location = dex.location(method_id)?;
+        let dex_location = format!(
+            "{}->{}{}",
+            location.class, location.method, location.descriptor
+        );
         let mapped = mapping
             .into_iter()
             .flat_map(|mapping| {
@@ -195,24 +181,16 @@ fn query_apk(
                 apk: apk.clone(),
                 dex: location.dex.to_owned(),
                 kind: 'M',
-                location: format!(
-                    "{}->{}{}",
-                    location.class, location.method, location.descriptor
-                ),
-                mapped_location: None,
+                location: dex_location,
                 source_file: location.source_file.map(str::to_owned),
             });
         } else {
-            for mapped_location in mapped {
+            for location_name in mapped {
                 output.push(OutputLocation {
                     apk: apk.clone(),
                     dex: location.dex.to_owned(),
                     kind: 'M',
-                    location: format!(
-                        "{}->{}{}",
-                        location.class, location.method, location.descriptor
-                    ),
-                    mapped_location: Some(mapped_location),
+                    location: location_name,
                     source_file: location.source_file.map(str::to_owned),
                 });
             }
@@ -235,10 +213,10 @@ fn query_classes(
                 apk: apk.to_owned(),
                 dex: location.dex.to_owned(),
                 kind: 'C',
-                location: location.class.to_owned(),
-                mapped_location: mapping
+                location: mapping
                     .and_then(|mapping| mapping.original_class(location.class))
-                    .map(str::to_owned),
+                    .unwrap_or(location.class)
+                    .to_owned(),
                 source_file: location.source_file.map(str::to_owned),
             });
         }
@@ -259,22 +237,25 @@ fn query_fields(
         if field_matches(&location, field, mapping)
             && class.is_none_or(|class| class_matches(location.class, class, mapping))
         {
-            let mapped_location = mapping.and_then(|mapping| {
-                let class = mapping.original_class(location.class)?;
-                mapping
-                    .fields(location.class, location.field, location.descriptor)
-                    .first()
-                    .map(|field| format!("{class}->{}:{}", field.name, field.descriptor))
-            });
+            let location_name = mapping
+                .and_then(|mapping| {
+                    let class = mapping.original_class(location.class)?;
+                    mapping
+                        .fields(location.class, location.field, location.descriptor)
+                        .first()
+                        .map(|field| format!("{class}->{}:{}", field.name, field.descriptor))
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}->{}:{}",
+                        location.class, location.field, location.descriptor
+                    )
+                });
             output.push(OutputLocation {
                 apk: apk.to_owned(),
                 dex: location.dex.to_owned(),
                 kind: 'F',
-                location: format!(
-                    "{}->{}:{}",
-                    location.class, location.field, location.descriptor
-                ),
-                mapped_location,
+                location: location_name,
                 source_file: location.source_file.map(str::to_owned),
             });
         }

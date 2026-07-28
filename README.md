@@ -32,7 +32,7 @@ such as `PlayerManager`, `com.example.PlayerManager`, or
 `--mapping` accepts an R8/ProGuard mapping file. It may also select one file
 inside a ZIP using `archive.zip!entry/path`; nested ZIPs are not supported.
 Class, method, and field queries then accept original or obfuscated names, and
-plain output adds a `MAPPED_LOCATION` column.
+mapped names replace `LOCATION` in the output.
 
 The project forbids `unsafe` in its own code. Parsing does not invoke a shell,
 `unzip`, or other system commands. DEX indexes are cached under `dexq/v1` in
