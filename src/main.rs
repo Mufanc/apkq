@@ -52,6 +52,7 @@ struct Cli {
 struct OutputLocation {
     apk: String,
     dex: String,
+    kind: char,
     location: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_file: Option<String>,
@@ -86,14 +87,16 @@ fn run(cli: Cli) -> Result<(), String> {
     } else if output.is_empty() {
         println!("No matches.");
     } else {
+        println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
         for location in output {
-            match location.source_file {
-                Some(source_file) => println!(
-                    "{}!{}\t{}\t{}",
-                    location.apk, location.dex, location.location, source_file
-                ),
-                None => println!("{}!{}\t{}", location.apk, location.dex, location.location),
-            }
+            println!(
+                "{}!{}\t{}\t{}\t{}",
+                location.apk,
+                location.dex,
+                location.kind,
+                location.location,
+                location.source_file.as_deref().unwrap_or_default()
+            );
         }
     }
     Ok(())
@@ -152,6 +155,7 @@ fn query_apk(
             Ok(OutputLocation {
                 apk: apk.clone(),
                 dex: location.dex.to_owned(),
+                kind: 'M',
                 location: format!(
                     "{}->{}{}",
                     location.class, location.method, location.descriptor
@@ -174,6 +178,7 @@ fn query_classes(
             output.push(OutputLocation {
                 apk: apk.to_owned(),
                 dex: location.dex.to_owned(),
+                kind: 'C',
                 location: location.class.to_owned(),
                 source_file: location.source_file.map(str::to_owned),
             });
@@ -196,6 +201,7 @@ fn query_fields(
             output.push(OutputLocation {
                 apk: apk.to_owned(),
                 dex: location.dex.to_owned(),
+                kind: 'F',
                 location: format!(
                     "{}->{}:{}",
                     location.class, location.field, location.descriptor
