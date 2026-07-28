@@ -12,6 +12,9 @@ target/release/dexq app.apk -f mCurrentPlayer
 target/release/dexq app.apk -s "request failed: "
 target/release/dexq app.apk -m someMethod -s "A value is "
 target/release/dexq app.apk -s "A is " -s "B is " --json
+target/release/dexq app.apk -c OriginalName --mapping mapping.txt
+target/release/dexq app.apk -m originalMethod \
+  --mapping 'mappings.zip!path/to/mapping.txt'
 ```
 
 The first positional argument may be an APK or a directory containing APKs.
@@ -25,6 +28,11 @@ Class names may be simple names, fully qualified Java names, or DEX descriptors,
 such as `PlayerManager`, `com.example.PlayerManager`, or
 `Lcom/example/PlayerManager;`. Inner classes must use `$`, for example
 `Outer$Inner` or `com.example.Outer$Inner`.
+
+`--mapping` accepts an R8/ProGuard mapping file. It may also select one file
+inside a ZIP using `archive.zip!entry/path`; nested ZIPs are not supported.
+Class, method, and field queries then accept original or obfuscated names, and
+plain output adds a `MAPPED_LOCATION` column.
 
 The project forbids `unsafe` in its own code. Parsing does not invoke a shell,
 `unzip`, or other system commands. DEX indexes are cached under `dexq/v1` in

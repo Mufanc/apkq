@@ -7,6 +7,8 @@ use std::process;
 
 use clap::{ArgGroup, Parser};
 use dexq::cache::{self, DexIndexView};
+use dexq::dex::{FieldLocationRef, MethodLocationRef};
+use dexq::mapping::{self, Mapping};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -46,6 +48,10 @@ struct Cli {
     /// Emit a JSON array
     #[arg(long)]
     json: bool,
+
+    /// R8/ProGuard mapping file, or ZIP entry as archive.zip!path/to/mapping.txt
+    #[arg(long, value_name = "FILE[!ENTRY]")]
+    mapping: Option<String>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -54,6 +60,8 @@ struct OutputLocation {
     dex: String,
     kind: char,
     location: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapped_location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_file: Option<String>,
 }
@@ -67,13 +75,14 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), String> {
     let apk_paths = collect_apks(&cli.input)?;
+    let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
     let strings = unique_strings(&cli.strings);
     let mut output = Vec::new();
 
     for apk in apk_paths {
         let cache_load = cache::load_or_build(&apk)?;
         let dex = cache_load.index.view()?;
-        output.extend(query_apk(&apk, dex, &cli, &strings)?);
+        output.extend(query_apk(&apk, dex, &cli, &strings, mapping.as_ref())?);
     }
 
     output.sort();
@@ -87,16 +96,32 @@ fn run(cli: Cli) -> Result<(), String> {
     } else if output.is_empty() {
         println!("No matches.");
     } else {
-        println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
+        if mapping.is_some() {
+            println!("APK/DEX\tKIND\tLOCATION\tMAPPED_LOCATION\tSOURCE");
+        } else {
+            println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
+        }
         for location in output {
-            println!(
-                "{}!{}\t{}\t{}\t{}",
-                location.apk,
-                location.dex,
-                location.kind,
-                location.location,
-                location.source_file.as_deref().unwrap_or_default()
-            );
+            if mapping.is_some() {
+                println!(
+                    "{}!{}\t{}\t{}\t{}\t{}",
+                    location.apk,
+                    location.dex,
+                    location.kind,
+                    location.location,
+                    location.mapped_location.as_deref().unwrap_or_default(),
+                    location.source_file.as_deref().unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "{}!{}\t{}\t{}\t{}",
+                    location.apk,
+                    location.dex,
+                    location.kind,
+                    location.location,
+                    location.source_file.as_deref().unwrap_or_default()
+                );
+            }
         }
     }
     Ok(())
@@ -107,22 +132,24 @@ fn query_apk(
     dex: DexIndexView<'_>,
     cli: &Cli,
     strings: &[String],
+    mapping: Option<&Mapping>,
 ) -> Result<Vec<OutputLocation>, String> {
     let apk = apk.display().to_string();
     let field_classes = cli
         .field
         .as_deref()
-        .map(|field| matching_field_classes(dex, cli.class.as_deref(), field))
+        .map(|field| matching_field_classes(dex, cli.class.as_deref(), field, mapping))
         .transpose()?;
 
     if cli.method.is_none() && strings.is_empty() {
         return if let Some(field) = cli.field.as_deref() {
-            query_fields(&apk, dex, cli.class.as_deref(), field)
+            query_fields(&apk, dex, cli.class.as_deref(), field, mapping)
         } else {
             query_classes(
                 &apk,
                 dex,
                 cli.class.as_deref().expect("clap requires a query"),
+                mapping,
             )
         };
     }
@@ -138,21 +165,33 @@ fn query_apk(
         };
         cli.method
             .as_deref()
-            .is_none_or(|method| location.method == method)
+            .is_none_or(|method| method_matches(&location, method, mapping))
             && cli
                 .class
                 .as_deref()
-                .is_none_or(|class| class_matches(location.class, class))
+                .is_none_or(|class| class_matches(location.class, class, mapping))
             && field_classes
                 .as_ref()
                 .is_none_or(|classes| classes.contains(location.class))
     });
 
-    method_ids
-        .into_iter()
-        .map(|method_id| {
-            let location = dex.location(method_id)?;
-            Ok(OutputLocation {
+    let mut output = Vec::new();
+    for method_id in method_ids {
+        let location = dex.location(method_id)?;
+        let mapped = mapping
+            .into_iter()
+            .flat_map(|mapping| {
+                let class = mapping.original_class(location.class);
+                mapping
+                    .methods(location.class, location.method, location.descriptor)
+                    .iter()
+                    .filter_map(move |method| {
+                        class.map(|class| format!("{class}->{}{}", method.name, method.descriptor))
+                    })
+            })
+            .collect::<Vec<_>>();
+        if mapped.is_empty() {
+            output.push(OutputLocation {
                 apk: apk.clone(),
                 dex: location.dex.to_owned(),
                 kind: 'M',
@@ -160,26 +199,46 @@ fn query_apk(
                     "{}->{}{}",
                     location.class, location.method, location.descriptor
                 ),
+                mapped_location: None,
                 source_file: location.source_file.map(str::to_owned),
-            })
-        })
-        .collect()
+            });
+        } else {
+            for mapped_location in mapped {
+                output.push(OutputLocation {
+                    apk: apk.clone(),
+                    dex: location.dex.to_owned(),
+                    kind: 'M',
+                    location: format!(
+                        "{}->{}{}",
+                        location.class, location.method, location.descriptor
+                    ),
+                    mapped_location: Some(mapped_location),
+                    source_file: location.source_file.map(str::to_owned),
+                });
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn query_classes(
     apk: &str,
     dex: DexIndexView<'_>,
     class: &str,
+    mapping: Option<&Mapping>,
 ) -> Result<Vec<OutputLocation>, String> {
     let mut output = Vec::new();
     for class_id in 0..dex.class_count() {
         let location = dex.class(class_id)?;
-        if class_matches(location.class, class) {
+        if class_matches(location.class, class, mapping) {
             output.push(OutputLocation {
                 apk: apk.to_owned(),
                 dex: location.dex.to_owned(),
                 kind: 'C',
                 location: location.class.to_owned(),
+                mapped_location: mapping
+                    .and_then(|mapping| mapping.original_class(location.class))
+                    .map(str::to_owned),
                 source_file: location.source_file.map(str::to_owned),
             });
         }
@@ -192,12 +251,21 @@ fn query_fields(
     dex: DexIndexView<'_>,
     class: Option<&str>,
     field: &str,
+    mapping: Option<&Mapping>,
 ) -> Result<Vec<OutputLocation>, String> {
     let mut output = Vec::new();
     for field_id in 0..dex.field_count() {
         let location = dex.field(field_id)?;
-        if location.field == field && class.is_none_or(|class| class_matches(location.class, class))
+        if field_matches(&location, field, mapping)
+            && class.is_none_or(|class| class_matches(location.class, class, mapping))
         {
+            let mapped_location = mapping.and_then(|mapping| {
+                let class = mapping.original_class(location.class)?;
+                mapping
+                    .fields(location.class, location.field, location.descriptor)
+                    .first()
+                    .map(|field| format!("{class}->{}:{}", field.name, field.descriptor))
+            });
             output.push(OutputLocation {
                 apk: apk.to_owned(),
                 dex: location.dex.to_owned(),
@@ -206,6 +274,7 @@ fn query_fields(
                     "{}->{}:{}",
                     location.class, location.field, location.descriptor
                 ),
+                mapped_location,
                 source_file: location.source_file.map(str::to_owned),
             });
         }
@@ -217,11 +286,13 @@ fn matching_field_classes(
     dex: DexIndexView<'_>,
     class: Option<&str>,
     field: &str,
+    mapping: Option<&Mapping>,
 ) -> Result<HashSet<String>, String> {
     let mut classes = HashSet::new();
     for field_id in 0..dex.field_count() {
         let location = dex.field(field_id)?;
-        if location.field == field && class.is_none_or(|class| class_matches(location.class, class))
+        if field_matches(&location, field, mapping)
+            && class.is_none_or(|class| class_matches(location.class, class, mapping))
         {
             classes.insert(location.class.to_owned());
         }
@@ -252,7 +323,14 @@ fn methods_referencing_all(
     Ok(candidates.unwrap_or_default())
 }
 
-fn class_matches(descriptor: &str, query: &str) -> bool {
+fn class_matches(descriptor: &str, query: &str, mapping: Option<&Mapping>) -> bool {
+    class_name_matches(descriptor, query)
+        || mapping
+            .and_then(|mapping| mapping.original_class(descriptor))
+            .is_some_and(|original| class_name_matches(original, query))
+}
+
+fn class_name_matches(descriptor: &str, query: &str) -> bool {
     if query.starts_with('L') && query.ends_with(';') {
         return descriptor == query;
     }
@@ -267,6 +345,30 @@ fn class_matches(descriptor: &str, query: &str) -> bool {
     } else {
         name.rsplit('/').next() == Some(query)
     }
+}
+
+fn method_matches(
+    location: &MethodLocationRef<'_>,
+    query: &str,
+    mapping: Option<&Mapping>,
+) -> bool {
+    location.method == query
+        || mapping.is_some_and(|mapping| {
+            mapping
+                .methods(location.class, location.method, location.descriptor)
+                .iter()
+                .any(|method| method.name == query)
+        })
+}
+
+fn field_matches(location: &FieldLocationRef<'_>, query: &str, mapping: Option<&Mapping>) -> bool {
+    location.field == query
+        || mapping.is_some_and(|mapping| {
+            mapping
+                .fields(location.class, location.field, location.descriptor)
+                .iter()
+                .any(|field| field.name == query)
+        })
 }
 
 fn collect_apks(input: &Path) -> Result<Vec<PathBuf>, String> {
@@ -339,11 +441,14 @@ mod tests {
             "A value is ",
             "-s",
             "B value is ",
+            "--mapping",
+            "maps.zip!release/mapping.txt",
             "--json",
         ])
         .unwrap();
         assert_eq!(cli.method.as_deref(), Some("someMethod"));
         assert_eq!(cli.strings, ["A value is ", "B value is "]);
+        assert_eq!(cli.mapping.as_deref(), Some("maps.zip!release/mapping.txt"));
         assert!(cli.json);
     }
 
@@ -362,29 +467,36 @@ mod tests {
     #[test]
     fn matches_simple_dotted_and_descriptor_class_names() {
         let descriptor = "Lcom/example/PlayerManager;";
-        assert!(class_matches(descriptor, "PlayerManager"));
-        assert!(class_matches(descriptor, "com.example.PlayerManager"));
-        assert!(class_matches(descriptor, descriptor));
-        assert!(!class_matches(descriptor, "OtherManager"));
+        assert!(class_matches(descriptor, "PlayerManager", None));
+        assert!(class_matches(descriptor, "com.example.PlayerManager", None));
+        assert!(class_matches(descriptor, descriptor, None));
+        assert!(!class_matches(descriptor, "OtherManager", None));
     }
 
     #[test]
     fn requires_dollar_notation_for_inner_classes() {
         let descriptor = "Lcom/ut/mini/UTHitBuilders$UTHitBuilder;";
-        assert!(class_matches(descriptor, "UTHitBuilders$UTHitBuilder"));
         assert!(class_matches(
             descriptor,
-            "com.ut.mini.UTHitBuilders$UTHitBuilder"
+            "UTHitBuilders$UTHitBuilder",
+            None
         ));
-        assert!(!class_matches(descriptor, "UTHitBuilder"));
+        assert!(class_matches(
+            descriptor,
+            "com.ut.mini.UTHitBuilders$UTHitBuilder",
+            None
+        ));
+        assert!(!class_matches(descriptor, "UTHitBuilder", None));
         assert!(!class_matches(
             descriptor,
-            "com.ut.mini.UTHitBuilders.UTHitBuilder"
+            "com.ut.mini.UTHitBuilders.UTHitBuilder",
+            None
         ));
-        assert!(class_matches("Lcom/example/Outer$1$1;", "Outer$1$1"));
+        assert!(class_matches("Lcom/example/Outer$1$1;", "Outer$1$1", None));
         assert!(class_matches(
             "Lcom/example/EglRenderer$$Lambda$1;",
-            "EglRenderer$$Lambda$1"
+            "EglRenderer$$Lambda$1",
+            None
         ));
     }
 
