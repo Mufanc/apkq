@@ -9,6 +9,7 @@ use clap::{ArgGroup, Parser};
 use dexq::cache::{self, DexIndexView};
 use dexq::dex::{FieldLocationRef, MethodLocationRef};
 use dexq::mapping::{self, Mapping};
+use regex::Regex;
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -18,7 +19,7 @@ use serde::Serialize;
     group = ArgGroup::new("query")
         .required(true)
         .multiple(true)
-        .args(["class", "method", "field", "strings"])
+        .args(["class", "method", "field", "strings", "regexes"])
 )]
 struct Cli {
     /// APK file or a directory containing APK files
@@ -45,6 +46,15 @@ struct Cli {
     )]
     strings: Vec<String>,
 
+    /// Regular expression matched against strings referenced by the same method; repeat for AND
+    #[arg(
+        short = 'r',
+        long = "regex",
+        value_name = "REGEX",
+        value_parser = non_empty
+    )]
+    regexes: Vec<String>,
+
     /// Emit a JSON array
     #[arg(long)]
     json: bool,
@@ -67,6 +77,20 @@ struct OutputLocation {
     source: Option<String>,
 }
 
+enum StringMatcher {
+    Literal(String),
+    Regex(Regex),
+}
+
+impl StringMatcher {
+    fn is_match(&self, value: &str) -> bool {
+        match self {
+            Self::Literal(literal) => value.contains(literal),
+            Self::Regex(regex) => regex.is_match(value),
+        }
+    }
+}
+
 fn main() {
     if let Err(error) = run(Cli::parse()) {
         eprintln!("error: {error}");
@@ -75,9 +99,9 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    let strings = string_matchers(&cli.strings, &cli.regexes)?;
     let apk_paths = collect_apks(&cli.input)?;
     let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
-    let strings = unique_strings(&cli.strings);
     let mut output = Vec::new();
 
     for apk in apk_paths {
@@ -145,7 +169,7 @@ fn print_aligned(output: &[OutputLocation]) {
 fn query_apk(
     dex: DexIndexView<'_>,
     cli: &Cli,
-    strings: &[String],
+    strings: &[StringMatcher],
     mapping: Option<&Mapping>,
 ) -> Result<Vec<OutputLocation>, String> {
     let field_classes = cli
@@ -307,13 +331,13 @@ fn matching_field_classes(
 
 fn methods_referencing_all(
     dex: DexIndexView<'_>,
-    strings: &[String],
+    strings: &[StringMatcher],
 ) -> Result<HashSet<usize>, String> {
     let mut candidates: Option<HashSet<usize>> = None;
     for query in strings {
         let mut matches = HashSet::new();
         for string_id in 0..dex.string_count() {
-            if dex.string_value(string_id)?.contains(query) {
+            if query.is_match(dex.string_value(string_id)?) {
                 matches.extend(dex.string_sites(string_id)?.map(|site| site.location_id));
             }
         }
@@ -423,6 +447,19 @@ fn unique_strings(strings: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn string_matchers(strings: &[String], regexes: &[String]) -> Result<Vec<StringMatcher>, String> {
+    let mut matchers = unique_strings(strings)
+        .into_iter()
+        .map(StringMatcher::Literal)
+        .collect::<Vec<_>>();
+    for pattern in unique_strings(regexes) {
+        let regex =
+            Regex::new(&pattern).map_err(|error| format!("invalid regex {pattern:?}: {error}"))?;
+        matchers.push(StringMatcher::Regex(regex));
+    }
+    Ok(matchers)
+}
+
 fn non_empty(value: &str) -> Result<String, String> {
     (!value.is_empty())
         .then(|| value.to_owned())
@@ -434,7 +471,7 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
 
-    use super::{Cli, OutputLocation, class_matches, unique_strings};
+    use super::{Cli, OutputLocation, class_matches, string_matchers, unique_strings};
 
     #[test]
     fn parses_the_compact_query_syntax() {
@@ -447,6 +484,8 @@ mod tests {
             "A value is ",
             "-s",
             "B value is ",
+            "-r",
+            "error=[0-9]+",
             "--mapping",
             "maps.zip!release/mapping.txt",
             "--aligned",
@@ -454,6 +493,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.method.as_deref(), Some("someMethod"));
         assert_eq!(cli.strings, ["A value is ", "B value is "]);
+        assert_eq!(cli.regexes, ["error=[0-9]+"]);
         assert_eq!(cli.mapping.as_deref(), Some("maps.zip!release/mapping.txt"));
         assert!(cli.aligned);
         assert!(!cli.json);
@@ -497,6 +537,18 @@ mod tests {
         let cli = Cli::try_parse_from(["dexq", "app.apk", "--string=-thread-"]).unwrap();
         assert_eq!(cli.strings, ["-thread-"]);
         assert!(Cli::try_parse_from(["dexq", "app.apk", "--string", "-thread-"]).is_err());
+    }
+
+    #[test]
+    fn matches_literal_and_regex_string_queries() {
+        let matchers =
+            string_matchers(&["status=".to_owned()], &["code=[0-9]+".to_owned()]).unwrap();
+        assert!(
+            matchers
+                .iter()
+                .all(|matcher| matcher.is_match("status=code=200"))
+        );
+        assert!(string_matchers(&[], &["[".to_owned()]).is_err());
     }
 
     #[test]

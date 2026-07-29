@@ -10,6 +10,7 @@ target/release/dexq app.apk -c PlayerManager
 target/release/dexq app.apk -m updateState
 target/release/dexq app.apk -f mCurrentPlayer
 target/release/dexq app.apk -s "request failed: "
+target/release/dexq app.apk -r 'request .* failed'
 target/release/dexq app.apk -m someMethod -s "A value is "
 target/release/dexq app.apk -s "A is " -s "B is " --json
 target/release/dexq app.apk -s "request failed: " --aligned
@@ -21,9 +22,10 @@ target/release/dexq app.apk -m originalMethod \
 The first positional argument may be an APK or a directory containing APKs.
 `-c/--class`, `-m/--method`, and `-f/--field` use exact name matching, while
 `-s/--string` uses substring matching. Multiple conditions are combined with
-AND. Repeating `-s` requires the same method to reference every string. When a
-field condition is combined with method or string conditions, only methods in
-classes that declare the field are returned.
+AND. `-r/--regex` matches a regular expression. Repeating or mixing `-s` and
+`-r` requires the same method to satisfy every condition. When a field
+condition is combined with method or string conditions, only methods in classes
+that declare the field are returned.
 
 Class names may be simple names, fully qualified Java names, or DEX descriptors,
 such as `PlayerManager`, `com.example.PlayerManager`, or
