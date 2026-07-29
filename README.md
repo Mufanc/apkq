@@ -36,7 +36,9 @@ Class, method, and field queries then accept original or obfuscated names, and
 mapped names replace `LOCATION` in the output.
 
 Plain output is tab-separated by default. Pass `--aligned` for space-aligned
-columns intended for terminal display.
+columns intended for terminal display. `FILE` is the path inside the input APK,
+such as `classes.dex` or `assets/inner.apk!classes2.dex`; the input APK name is
+not repeated.
 
 The project forbids `unsafe` in its own code. Parsing does not invoke a shell,
 `unzip`, or other system commands. DEX indexes are cached under `dexq/v1` in

@@ -60,12 +60,11 @@ struct Cli {
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct OutputLocation {
-    apk: String,
-    dex: String,
+    file: String,
+    #[serde(rename = "type")]
     kind: char,
     location: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_file: Option<String>,
+    source: Option<String>,
 }
 
 fn main() {
@@ -84,7 +83,7 @@ fn run(cli: Cli) -> Result<(), String> {
     for apk in apk_paths {
         let cache_load = cache::load_or_build(&apk)?;
         let dex = cache_load.index.view()?;
-        output.extend(query_apk(&apk, dex, &cli, &strings, mapping.as_ref())?);
+        output.extend(query_apk(dex, &cli, &strings, mapping.as_ref())?);
     }
 
     output.sort();
@@ -100,15 +99,14 @@ fn run(cli: Cli) -> Result<(), String> {
     } else if cli.aligned {
         print_aligned(&output);
     } else {
-        println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
+        println!("FILE\tTYPE\tLOCATION\tSOURCE");
         for location in output {
             println!(
-                "{}!{}\t{}\t{}\t{}",
-                location.apk,
-                location.dex,
+                "{}\t{}\t{}\t{}",
+                location.file,
                 location.kind,
                 location.location,
-                location.source_file.as_deref().unwrap_or_default()
+                location.source.as_deref().unwrap_or_default()
             );
         }
     }
@@ -116,12 +114,12 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn print_aligned(output: &[OutputLocation]) {
-    let apk_width = output
+    let file_width = output
         .iter()
-        .map(|location| location.apk.chars().count() + 1 + location.dex.chars().count())
+        .map(|location| location.file.chars().count())
         .max()
         .unwrap_or_default()
-        .max("APK/DEX".len());
+        .max("FILE".len());
     let location_width = output
         .iter()
         .map(|location| location.location.chars().count())
@@ -130,28 +128,26 @@ fn print_aligned(output: &[OutputLocation]) {
         .max("LOCATION".len());
 
     println!(
-        "{:<apk_width$}  {:<4}  {:<location_width$}  SOURCE",
-        "APK/DEX", "KIND", "LOCATION"
+        "{:<file_width$}  {:<4}  {:<location_width$}  SOURCE",
+        "FILE", "TYPE", "LOCATION"
     );
     for location in output {
-        let apk = format!("{}!{}", location.apk, location.dex);
         println!(
-            "{apk:<apk_width$}  {:<4}  {:<location_width$}  {}",
+            "{:<file_width$}  {:<4}  {:<location_width$}  {}",
+            location.file,
             location.kind,
             location.location,
-            location.source_file.as_deref().unwrap_or_default()
+            location.source.as_deref().unwrap_or_default()
         );
     }
 }
 
 fn query_apk(
-    apk: &Path,
     dex: DexIndexView<'_>,
     cli: &Cli,
     strings: &[String],
     mapping: Option<&Mapping>,
 ) -> Result<Vec<OutputLocation>, String> {
-    let apk = apk.display().to_string();
     let field_classes = cli
         .field
         .as_deref()
@@ -160,10 +156,9 @@ fn query_apk(
 
     if cli.method.is_none() && strings.is_empty() {
         return if let Some(field) = cli.field.as_deref() {
-            query_fields(&apk, dex, cli.class.as_deref(), field, mapping)
+            query_fields(dex, cli.class.as_deref(), field, mapping)
         } else {
             query_classes(
-                &apk,
                 dex,
                 cli.class.as_deref().expect("clap requires a query"),
                 mapping,
@@ -213,20 +208,18 @@ fn query_apk(
             .collect::<Vec<_>>();
         if mapped.is_empty() {
             output.push(OutputLocation {
-                apk: apk.clone(),
-                dex: location.dex.to_owned(),
+                file: location.dex.to_owned(),
                 kind: 'M',
                 location: dex_location,
-                source_file: location.source_file.map(str::to_owned),
+                source: location.source_file.map(str::to_owned),
             });
         } else {
             for location_name in mapped {
                 output.push(OutputLocation {
-                    apk: apk.clone(),
-                    dex: location.dex.to_owned(),
+                    file: location.dex.to_owned(),
                     kind: 'M',
                     location: location_name,
-                    source_file: location.source_file.map(str::to_owned),
+                    source: location.source_file.map(str::to_owned),
                 });
             }
         }
@@ -235,7 +228,6 @@ fn query_apk(
 }
 
 fn query_classes(
-    apk: &str,
     dex: DexIndexView<'_>,
     class: &str,
     mapping: Option<&Mapping>,
@@ -245,14 +237,13 @@ fn query_classes(
         let location = dex.class(class_id)?;
         if class_matches(location.class, class, mapping) {
             output.push(OutputLocation {
-                apk: apk.to_owned(),
-                dex: location.dex.to_owned(),
+                file: location.dex.to_owned(),
                 kind: 'C',
                 location: mapping
                     .and_then(|mapping| mapping.original_class(location.class))
                     .unwrap_or(location.class)
                     .to_owned(),
-                source_file: location.source_file.map(str::to_owned),
+                source: location.source_file.map(str::to_owned),
             });
         }
     }
@@ -260,7 +251,6 @@ fn query_classes(
 }
 
 fn query_fields(
-    apk: &str,
     dex: DexIndexView<'_>,
     class: Option<&str>,
     field: &str,
@@ -287,11 +277,10 @@ fn query_fields(
                     )
                 });
             output.push(OutputLocation {
-                apk: apk.to_owned(),
-                dex: location.dex.to_owned(),
+                file: location.dex.to_owned(),
                 kind: 'F',
                 location: location_name,
-                source_file: location.source_file.map(str::to_owned),
+                source: location.source_file.map(str::to_owned),
             });
         }
     }
@@ -443,8 +432,9 @@ fn non_empty(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use serde_json::json;
 
-    use super::{Cli, class_matches, unique_strings};
+    use super::{Cli, OutputLocation, class_matches, unique_strings};
 
     #[test]
     fn parses_the_compact_query_syntax() {
@@ -474,6 +464,26 @@ mod tests {
         assert!(
             Cli::try_parse_from(["dexq", "app.apk", "-m", "someMethod", "--aligned", "--json"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn serializes_only_the_public_output_columns() {
+        let location = OutputLocation {
+            file: "assets/inner.apk!classes2.dex".to_owned(),
+            kind: 'M',
+            location: "Lexample/Player;->play()V".to_owned(),
+            source: Some("Player.java".to_owned()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(location).unwrap(),
+            json!({
+                "file": "assets/inner.apk!classes2.dex",
+                "type": "M",
+                "location": "Lexample/Player;->play()V",
+                "source": "Player.java"
+            })
         );
     }
 
