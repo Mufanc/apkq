@@ -12,6 +12,7 @@ target/release/dexq app.apk -f mCurrentPlayer
 target/release/dexq app.apk -s "request failed: "
 target/release/dexq app.apk -m someMethod -s "A value is "
 target/release/dexq app.apk -s "A is " -s "B is " --json
+target/release/dexq app.apk -s "request failed: " --aligned
 target/release/dexq app.apk -c OriginalName --mapping mapping.txt
 target/release/dexq app.apk -m originalMethod \
   --mapping 'mappings.zip!path/to/mapping.txt'
@@ -33,6 +34,9 @@ such as `PlayerManager`, `com.example.PlayerManager`, or
 inside a ZIP using `archive.zip!entry/path`; nested ZIPs are not supported.
 Class, method, and field queries then accept original or obfuscated names, and
 mapped names replace `LOCATION` in the output.
+
+Plain output is tab-separated by default. Pass `--aligned` for space-aligned
+columns intended for terminal display.
 
 The project forbids `unsafe` in its own code. Parsing does not invoke a shell,
 `unzip`, or other system commands. DEX indexes are cached under `dexq/v1` in

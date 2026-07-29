@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Align plain-text output columns with spaces
+    #[arg(long, conflicts_with = "json")]
+    aligned: bool,
+
     /// R8/ProGuard mapping file, or ZIP entry as archive.zip!path/to/mapping.txt
     #[arg(long, value_name = "FILE[!ENTRY]")]
     mapping: Option<String>,
@@ -93,6 +97,8 @@ fn run(cli: Cli) -> Result<(), String> {
         );
     } else if output.is_empty() {
         println!("No matches.");
+    } else if cli.aligned {
+        print_aligned(&output);
     } else {
         println!("APK/DEX\tKIND\tLOCATION\tSOURCE");
         for location in output {
@@ -107,6 +113,35 @@ fn run(cli: Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn print_aligned(output: &[OutputLocation]) {
+    let apk_width = output
+        .iter()
+        .map(|location| location.apk.chars().count() + 1 + location.dex.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("APK/DEX".len());
+    let location_width = output
+        .iter()
+        .map(|location| location.location.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("LOCATION".len());
+
+    println!(
+        "{:<apk_width$}  {:<4}  {:<location_width$}  SOURCE",
+        "APK/DEX", "KIND", "LOCATION"
+    );
+    for location in output {
+        let apk = format!("{}!{}", location.apk, location.dex);
+        println!(
+            "{apk:<apk_width$}  {:<4}  {:<location_width$}  {}",
+            location.kind,
+            location.location,
+            location.source_file.as_deref().unwrap_or_default()
+        );
+    }
 }
 
 fn query_apk(
@@ -424,13 +459,22 @@ mod tests {
             "B value is ",
             "--mapping",
             "maps.zip!release/mapping.txt",
-            "--json",
+            "--aligned",
         ])
         .unwrap();
         assert_eq!(cli.method.as_deref(), Some("someMethod"));
         assert_eq!(cli.strings, ["A value is ", "B value is "]);
         assert_eq!(cli.mapping.as_deref(), Some("maps.zip!release/mapping.txt"));
-        assert!(cli.json);
+        assert!(cli.aligned);
+        assert!(!cli.json);
+    }
+
+    #[test]
+    fn rejects_aligned_json_output() {
+        assert!(
+            Cli::try_parse_from(["dexq", "app.apk", "-m", "someMethod", "--aligned", "--json"])
+                .is_err()
+        );
     }
 
     #[test]
