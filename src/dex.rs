@@ -28,7 +28,16 @@ pub struct DexIndex {
     pub locations: Vec<MethodLocation>,
     pub fields: Vec<FieldLocation>,
     pub strings: Vec<IndexedString>,
+    pub called_methods: Vec<CalledMethod>,
     pub stats: DexStats,
+}
+
+#[derive(Debug)]
+pub struct CalledMethod {
+    pub class: String,
+    pub method: String,
+    pub descriptor: String,
+    pub callers: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -68,7 +77,14 @@ pub struct MethodLocationRef<'a> {
 pub struct ClassLocationRef<'a> {
     pub dex: &'a str,
     pub class: &'a str,
+    pub superclass: Option<&'a str>,
     pub source_file: Option<&'a str>,
+}
+
+pub struct CalledMethodRef<'a> {
+    pub class: &'a str,
+    pub method: &'a str,
+    pub descriptor: &'a str,
 }
 
 pub struct FieldLocationRef<'a> {
@@ -105,6 +121,8 @@ pub struct MethodLocation {
 pub struct ClassLocation {
     pub dex: String,
     pub class: String,
+    pub superclass: Option<String>,
+    pub interfaces: Vec<String>,
     pub source_file: Option<String>,
 }
 
@@ -209,6 +227,7 @@ pub fn index_prepared(prepared: &PreparedArchive) -> Result<DexIndex, String> {
         locations: Vec::new(),
         fields: Vec::new(),
         strings: Vec::new(),
+        called_methods: Vec::new(),
         stats: DexStats::default(),
     };
     index_archive(prepared, &mut index)?;
@@ -420,18 +439,28 @@ fn parse_dex(data: &[u8], label: &str, index: &mut DexIndex) -> Result<(), Strin
     }
 
     let mut sites_by_string = vec![Vec::new(); strings.len()];
+    let mut callers_by_method = vec![Vec::new(); methods.len()];
     for class_index in 0..class_defs_size {
         let offset = class_defs_off + class_index * 32;
         let class_idx = u32_at(data, offset)? as usize;
+        let superclass_idx = u32_at(data, offset + 8)?;
+        let interfaces_off = u32_at(data, offset + 12)? as usize;
         let source_idx = u32_at(data, offset + 16)?;
         let class_data_off = u32_at(data, offset + 24)? as usize;
         let class = string_for_type(&types, &strings, class_idx)?.to_owned();
+        let superclass = (superclass_idx != u32::MAX)
+            .then(|| string_for_type(&types, &strings, superclass_idx as usize))
+            .transpose()?
+            .map(str::to_owned);
+        let interfaces = read_type_list(data, interfaces_off, &types, &strings)?;
         let source_file = (source_idx != u32::MAX)
             .then(|| strings.get(source_idx as usize).cloned())
             .flatten();
         index.classes.push(ClassLocation {
             dex: label.to_owned(),
             class: class.clone(),
+            superclass,
+            interfaces,
             source_file: source_file.clone(),
         });
         if class_data_off == 0 {
@@ -447,8 +476,23 @@ fn parse_dex(data: &[u8], label: &str, index: &mut DexIndex) -> Result<(), Strin
             &methods,
             &static_strings_by_field,
             &mut sites_by_string,
+            &mut callers_by_method,
             index,
         )?;
+    }
+
+    for (method, mut callers) in methods.into_iter().zip(callers_by_method) {
+        if callers.is_empty() {
+            continue;
+        }
+        callers.sort_unstable();
+        callers.dedup();
+        index.called_methods.push(CalledMethod {
+            class: method.class,
+            method: method.name,
+            descriptor: method.descriptor,
+            callers,
+        });
     }
 
     index.stats.dex_files += 1;
@@ -485,6 +529,7 @@ fn parse_class_data(
     methods: &[MethodId],
     static_strings_by_field: &[Option<usize>],
     sites_by_string: &mut [Vec<StringSite>],
+    callers_by_method: &mut [Vec<usize>],
     index: &mut DexIndex,
 ) -> Result<(), String> {
     let mut cursor = offset;
@@ -577,6 +622,12 @@ fn parse_class_data(
                 });
                 index.stats.static_value_references += 1;
             }
+            for method_idx in references.methods {
+                callers_by_method
+                    .get_mut(method_idx)
+                    .ok_or_else(|| format!("bad invoked method index in {label}"))?
+                    .push(location_id);
+            }
         }
     }
     Ok(())
@@ -586,6 +637,7 @@ fn parse_class_data(
 struct CodeReferences {
     strings: Vec<(usize, u32)>,
     static_fields: Vec<(usize, u32)>,
+    methods: Vec<usize>,
 }
 
 fn parse_code_item(data: &[u8], offset: usize) -> Result<CodeReferences, String> {
@@ -612,6 +664,10 @@ fn parse_code_item(data: &[u8], offset: usize) -> Result<CodeReferences, String>
             references
                 .static_fields
                 .push((u16_at(data, insns_off + (pc + 1) * 2)? as usize, pc as u32));
+        } else if matches!(opcode, 0x6e..=0x72 | 0x74..=0x78 | 0xfa | 0xfb) {
+            references
+                .methods
+                .push(u16_at(data, insns_off + (pc + 1) * 2)? as usize);
         }
         let width = instruction_width(data, insns_off, pc, insns_size)?;
         pc = pc.checked_add(width).ok_or("instruction offset overflow")?;
@@ -811,6 +867,25 @@ fn parse_proto(
     Ok(descriptor)
 }
 
+fn read_type_list(
+    data: &[u8],
+    offset: usize,
+    types: &[usize],
+    strings: &[String],
+) -> Result<Vec<String>, String> {
+    if offset == 0 {
+        return Ok(Vec::new());
+    }
+    let size = u32_at(data, offset)? as usize;
+    check_table(data, offset + 4, size, 2)?;
+    (0..size)
+        .map(|index| {
+            let type_idx = u16_at(data, offset + 4 + index * 2)? as usize;
+            string_for_type(types, strings, type_idx).map(str::to_owned)
+        })
+        .collect()
+}
+
 fn string_for_type<'a>(
     types: &[usize],
     strings: &'a [String],
@@ -902,7 +977,10 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
-    use super::{is_classes_dex, prepare_archive, read_mutf8, read_static_string_values};
+    use super::{
+        is_classes_dex, parse_code_item, prepare_archive, read_mutf8, read_static_string_values,
+        read_type_list,
+    };
 
     #[test]
     fn recognizes_dex_names_and_mutf8() {
@@ -924,6 +1002,33 @@ mod tests {
             1
         );
         assert_eq!(strings_by_field[7], Some(2));
+    }
+
+    #[test]
+    fn reads_invoke_targets_without_call_site_details() {
+        let instructions: [u16; 13] = [0x006e, 7, 0, 0x0074, 7, 0, 0x00fa, 8, 0, 0, 0x00fc, 9, 0];
+        let mut data = vec![0; 16];
+        data[12..16].copy_from_slice(&(instructions.len() as u32).to_le_bytes());
+        for instruction in instructions {
+            data.extend_from_slice(&instruction.to_le_bytes());
+        }
+
+        assert_eq!(parse_code_item(&data, 0).unwrap().methods, [7, 7, 8]);
+    }
+
+    #[test]
+    fn reads_class_interfaces() {
+        let data = [0, 2, 0, 0, 0, 0, 0, 1, 0];
+        assert_eq!(
+            read_type_list(
+                &data,
+                1,
+                &[0, 1],
+                &["LFirst;".to_owned(), "LSecond;".to_owned()]
+            )
+            .unwrap(),
+            ["LFirst;", "LSecond;"]
+        );
     }
 
     #[test]

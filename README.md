@@ -7,6 +7,8 @@ and does not invoke JADX, `unzip`, or other system commands.
 ## Capabilities
 
 - Query classes, methods, and fields by exact name.
+- Find methods that call a method.
+- Find classes that extend a class or implement an interface.
 - Find methods that reference literal or regex-matched strings.
 - Combine class, method, field, and string conditions with AND semantics.
 - Apply R8/ProGuard mappings during name matching and output.
@@ -34,7 +36,8 @@ cargo install --path .
 
 ```text
 dexq [OPTIONS] <--class <NAME>|--method <NAME>|--field <NAME>|
-                 --string <TEXT>|--regex <REGEX>> <INPUT>
+                 --string <TEXT>|--regex <REGEX>|--callers-of <METHOD>|
+                 --inherits <CLASS>> <INPUT>
 ```
 
 `INPUT` is one APK or a directory containing APK files.
@@ -46,6 +49,8 @@ dexq [OPTIONS] <--class <NAME>|--method <NAME>|--field <NAME>|
 | `-f, --field <NAME>` | Exact field name |
 | `-s, --string <TEXT>` | Literal substring referenced by a method |
 | `-r, --regex <REGEX>` | Regular expression matched against referenced strings |
+| `--callers-of <METHOD>` | Methods that invoke the named method |
+| `--inherits <CLASS>` | Classes that directly or indirectly extend or implement the class |
 | `--mapping <FILE[!ENTRY]>` | R8/ProGuard mapping file |
 | `--aligned` | Space-aligned terminal output |
 | `--json` | JSON output |
@@ -58,6 +63,8 @@ dexq app.apk -m updateState -s 'state='
 dexq app.apk -r '^request .* failed$'
 dexq app.apk -s 'request ' -r 'code=[45][0-9]{2}'
 dexq app.apk -m originalMethod --mapping mapping.txt
+dexq app.apk --callers-of 'Lcom/example/Player;->play()V'
+dexq app.apk --inherits android.view.View
 dexq app.apk -c OriginalName \
   --mapping 'mappings.zip!release/mapping.txt' --json
 ```
@@ -66,6 +73,10 @@ Repeated and mixed query conditions are ANDed. In particular, every `-s` and
 `-r` condition must be satisfied by strings referenced from the same method.
 A field condition combined with a method or string condition restricts results
 to methods in classes that declare that field.
+
+`--callers-of` accepts a method name, `CLASS->NAME`, or a full
+`CLASS->NAME(DESCRIPTOR)` reference. It and `--inherits` are standalone query
+modes. Callers are deduplicated, and inheritance results are transitive.
 
 Class queries accept simple names, dotted Java names, and DEX descriptors:
 
@@ -128,7 +139,7 @@ The project uses Rust edition 2024 and forbids `unsafe` in its own code.
 
 ## Cache
 
-Indexes are stored under `dexq/v1` in the platform cache directory. Set
+Indexes are stored under `dexq/v2` in the platform cache directory. Set
 `DEXQ_CACHE_DIR` to override the location.
 
 The cache key is derived from the recursive DEX tree. Changes to resources,
@@ -141,5 +152,7 @@ index.
 - Embedded APK traversal is limited to three levels.
 - Strings produced at runtime or stored only in resources or native libraries
   are outside the index.
+- Caller queries cover explicit DEX method invocations, not reflection, JNI, or
+  resolved runtime targets of virtual dispatch.
 - Regex syntax follows Rust's `regex` crate and excludes look-around and
   backreferences.

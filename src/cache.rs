@@ -11,12 +11,12 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Serialize};
 
 use crate::dex::{
-    self, ClassLocationRef, DexIndex, DexSource, DexStats, FieldLocationRef, MethodLocationRef,
-    ReferenceKind, StringSiteRef,
+    self, CalledMethodRef, ClassLocationRef, DexIndex, DexSource, DexStats, FieldLocationRef,
+    MethodLocationRef, ReferenceKind, StringSiteRef,
 };
 
-const CACHE_MAGIC: [u8; 8] = *b"DEXQ0001";
-const CACHE_VERSION: u32 = 1;
+const CACHE_MAGIC: [u8; 8] = *b"DEXQ0002";
+const CACHE_VERSION: u32 = 2;
 const NO_TEXT: u32 = u32::MAX;
 
 #[derive(Archive, Serialize)]
@@ -29,6 +29,9 @@ struct CacheData {
     locations: Vec<CachedLocation>,
     fields: Vec<CachedField>,
     strings: Vec<CachedString>,
+    interfaces: Vec<TextRange>,
+    called_methods: Vec<CachedCalledMethod>,
+    caller_ids: Vec<u32>,
     site_location_ids: Vec<u32>,
     site_pcs: Vec<u32>,
     site_kinds: Vec<u8>,
@@ -52,7 +55,19 @@ struct CachedLocation {
 struct CachedClass {
     dex: TextRange,
     class: TextRange,
+    superclass: TextRange,
+    interface_start: u32,
+    interface_count: u32,
     source_file: TextRange,
+}
+
+#[derive(Archive, Serialize)]
+struct CachedCalledMethod {
+    class: TextRange,
+    method: TextRange,
+    descriptor: TextRange,
+    caller_start: u32,
+    caller_count: u32,
 }
 
 #[derive(Archive, Serialize)]
@@ -126,11 +141,36 @@ impl<'a> DexIndexView<'a> {
         let source_file = (location.source_file.offset.to_native() != NO_TEXT)
             .then(|| self.text(&location.source_file))
             .transpose()?;
+        let superclass = (location.superclass.offset.to_native() != NO_TEXT)
+            .then(|| self.text(&location.superclass))
+            .transpose()?;
         Ok(ClassLocationRef {
             dex: self.text(&location.dex)?,
             class: self.text(&location.class)?,
+            superclass,
             source_file,
         })
+    }
+
+    pub fn class_interfaces(
+        self,
+        index: usize,
+    ) -> Result<impl Iterator<Item = Result<&'a str, String>> + 'a, String> {
+        let location = self
+            .archived
+            .classes
+            .get(index)
+            .ok_or_else(|| format!("cached class index out of bounds: {index}"))?;
+        let start = location.interface_start.to_native() as usize;
+        let end = start
+            .checked_add(location.interface_count.to_native() as usize)
+            .ok_or("cached interface range overflow")?;
+        let interfaces = self
+            .archived
+            .interfaces
+            .get(start..end)
+            .ok_or("cached interface range is invalid")?;
+        Ok(interfaces.iter().map(move |interface| self.text(interface)))
     }
 
     pub fn method_count(self) -> usize {
@@ -139,6 +179,45 @@ impl<'a> DexIndexView<'a> {
 
     pub fn field_count(self) -> usize {
         self.archived.fields.len()
+    }
+
+    pub fn called_method_count(self) -> usize {
+        self.archived.called_methods.len()
+    }
+
+    pub fn called_method(self, index: usize) -> Result<CalledMethodRef<'a>, String> {
+        let method = self
+            .archived
+            .called_methods
+            .get(index)
+            .ok_or_else(|| format!("cached called method index out of bounds: {index}"))?;
+        Ok(CalledMethodRef {
+            class: self.text(&method.class)?,
+            method: self.text(&method.method)?,
+            descriptor: self.text(&method.descriptor)?,
+        })
+    }
+
+    pub fn called_methods_named(self, name: &str) -> Result<std::ops::Range<usize>, String> {
+        Ok(self.called_method_bound(name, false)?..self.called_method_bound(name, true)?)
+    }
+
+    pub fn callers(self, index: usize) -> Result<impl Iterator<Item = usize> + 'a, String> {
+        let method = self
+            .archived
+            .called_methods
+            .get(index)
+            .ok_or_else(|| format!("cached called method index out of bounds: {index}"))?;
+        let start = method.caller_start.to_native() as usize;
+        let end = start
+            .checked_add(method.caller_count.to_native() as usize)
+            .ok_or("cached caller range overflow")?;
+        let callers = self
+            .archived
+            .caller_ids
+            .get(start..end)
+            .ok_or("cached caller range is invalid")?;
+        Ok(callers.iter().map(|caller| caller.to_native() as usize))
     }
 
     pub fn field(self, index: usize) -> Result<FieldLocationRef<'a>, String> {
@@ -248,6 +327,21 @@ impl<'a> DexIndexView<'a> {
             .ok_or_else(|| format!("cached class index out of bounds: {index}"))
     }
 
+    fn called_method_bound(self, name: &str, after_equal: bool) -> Result<usize, String> {
+        let mut low = 0;
+        let mut high = self.called_method_count();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let method = self.called_method(middle)?.method;
+            if method < name || (after_equal && method == name) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
     fn source_file(self, class: &'a ArchivedCachedClass) -> Result<Option<&'a str>, String> {
         (class.source_file.offset.to_native() != NO_TEXT)
             .then(|| self.text(&class.source_file))
@@ -353,7 +447,7 @@ fn cache_path(fingerprint: [u8; 32]) -> Result<PathBuf, String> {
         ProjectDirs::from("", "", "dexq")
             .ok_or("failed to locate the system cache directory")?
             .cache_dir()
-            .join("v1")
+            .join("v2")
     };
     let name = blake3::Hash::from_bytes(fingerprint).to_hex();
     Ok(root.join(format!("{name}.rkyv")))
@@ -396,14 +490,23 @@ fn compact(parsed: &DexIndex, fingerprint: [u8; 32]) -> Result<CacheData, String
     let mut interned = HashMap::new();
     let mut class_ids = HashMap::new();
     let mut classes = Vec::with_capacity(parsed.classes.len());
+    let mut interfaces = Vec::new();
     for (class_id, location) in parsed.classes.iter().enumerate() {
         class_ids.insert(
             (location.dex.as_str(), location.class.as_str()),
             u32::try_from(class_id).map_err(|_| "too many classes")?,
         );
+        let interface_start = u32::try_from(interfaces.len()).map_err(|_| "too many interfaces")?;
+        for interface in &location.interfaces {
+            interfaces.push(intern(interface, &mut interned, &mut text)?);
+        }
         classes.push(CachedClass {
             dex: intern(&location.dex, &mut interned, &mut text)?,
             class: intern(&location.class, &mut interned, &mut text)?,
+            superclass: optional_text(location.superclass.as_deref(), &mut interned, &mut text)?,
+            interface_start,
+            interface_count: u32::try_from(location.interfaces.len())
+                .map_err(|_| "too many interfaces")?,
             source_file: optional_text(location.source_file.as_deref(), &mut interned, &mut text)?,
         });
     }
@@ -451,6 +554,47 @@ fn compact(parsed: &DexIndex, fingerprint: [u8; 32]) -> Result<CacheData, String
         });
     }
 
+    let mut called = parsed.called_methods.iter().collect::<Vec<_>>();
+    called.sort_unstable_by(|left, right| {
+        (&left.method, &left.class, &left.descriptor).cmp(&(
+            &right.method,
+            &right.class,
+            &right.descriptor,
+        ))
+    });
+    let mut called_methods = Vec::new();
+    let mut caller_ids = Vec::new();
+    let mut index = 0;
+    while let Some(method) = called.get(index) {
+        let mut end = index + 1;
+        while called.get(end).is_some_and(|candidate| {
+            candidate.class == method.class
+                && candidate.method == method.method
+                && candidate.descriptor == method.descriptor
+        }) {
+            end += 1;
+        }
+        let mut callers = called[index..end]
+            .iter()
+            .flat_map(|method| method.callers.iter().copied())
+            .collect::<Vec<_>>();
+        callers.sort_unstable();
+        callers.dedup();
+        let caller_start = u32::try_from(caller_ids.len()).map_err(|_| "too many callers")?;
+        for caller in callers {
+            caller_ids.push(u32::try_from(caller).map_err(|_| "too many method locations")?);
+        }
+        called_methods.push(CachedCalledMethod {
+            class: intern(&method.class, &mut interned, &mut text)?,
+            method: intern(&method.method, &mut interned, &mut text)?,
+            descriptor: intern(&method.descriptor, &mut interned, &mut text)?,
+            caller_start,
+            caller_count: u32::try_from(caller_ids.len()).map_err(|_| "too many callers")?
+                - caller_start,
+        });
+        index = end;
+    }
+
     Ok(CacheData {
         magic: CACHE_MAGIC,
         version: CACHE_VERSION,
@@ -460,6 +604,9 @@ fn compact(parsed: &DexIndex, fingerprint: [u8; 32]) -> Result<CacheData, String
         locations,
         fields,
         strings,
+        interfaces,
+        called_methods,
+        caller_ids,
         site_location_ids,
         site_pcs,
         site_kinds,
@@ -530,8 +677,12 @@ fn stats_from_archived(stats: &ArchivedCachedStats) -> DexStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextRange, intern};
     use std::collections::HashMap;
+
+    use rkyv::rancor::Error;
+
+    use super::{LoadedDexIndex, TextRange, compact, intern};
+    use crate::dex::{CalledMethod, ClassLocation, DexIndex, DexStats, MethodLocation};
 
     #[test]
     fn interns_text_once() {
@@ -542,5 +693,51 @@ mod tests {
         assert_eq!(first.offset, second.offset);
         assert_eq!(text, b"same");
         let _range: TextRange = first;
+    }
+
+    #[test]
+    fn compacts_callers_and_class_relations() {
+        let parsed = DexIndex {
+            classes: vec![ClassLocation {
+                dex: "classes.dex".to_owned(),
+                class: "LChild;".to_owned(),
+                superclass: Some("LParent;".to_owned()),
+                interfaces: vec!["LRunnable;".to_owned()],
+                source_file: Some("Child.java".to_owned()),
+            }],
+            locations: vec![MethodLocation {
+                dex: "classes.dex".to_owned(),
+                class: "LChild;".to_owned(),
+                method: "run".to_owned(),
+                descriptor: "()V".to_owned(),
+                source_file: Some("Child.java".to_owned()),
+            }],
+            fields: Vec::new(),
+            strings: Vec::new(),
+            called_methods: vec![CalledMethod {
+                class: "LTarget;".to_owned(),
+                method: "work".to_owned(),
+                descriptor: "()V".to_owned(),
+                callers: vec![0, 0],
+            }],
+            stats: DexStats::default(),
+        };
+        let data = compact(&parsed, [0; 32]).unwrap();
+        let index = LoadedDexIndex {
+            bytes: rkyv::to_bytes::<Error>(&data).unwrap(),
+        };
+        let view = index.view().unwrap();
+
+        let class = view.class(0).unwrap();
+        assert_eq!(class.superclass, Some("LParent;"));
+        assert_eq!(
+            view.class_interfaces(0)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            ["LRunnable;"]
+        );
+        assert_eq!(view.called_methods_named("work").unwrap(), 0..1);
+        assert_eq!(view.callers(0).unwrap().collect::<Vec<_>>(), [0]);
     }
 }

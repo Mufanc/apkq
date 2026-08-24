@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{ArgGroup, Parser};
 use dexq::cache::{self, DexIndexView};
-use dexq::dex::{FieldLocationRef, MethodLocationRef};
+use dexq::dex::{CalledMethodRef, ClassLocationRef, FieldLocationRef, MethodLocationRef};
 use dexq::mapping::{self, Mapping};
 use regex::Regex;
 use serde::Serialize;
@@ -19,7 +19,15 @@ use serde::Serialize;
     group = ArgGroup::new("query")
         .required(true)
         .multiple(true)
-        .args(["class", "method", "field", "strings", "regexes"])
+        .args([
+            "class",
+            "method",
+            "field",
+            "strings",
+            "regexes",
+            "callers_of",
+            "inherits"
+        ])
 )]
 struct Cli {
     /// APK file or a directory containing APK files
@@ -55,6 +63,24 @@ struct Cli {
     )]
     regexes: Vec<String>,
 
+    /// Find methods that invoke NAME, CLASS->NAME, or CLASS->NAME(DESCRIPTOR)
+    #[arg(
+        long = "callers-of",
+        value_name = "[CLASS->]NAME[(DESCRIPTOR)]",
+        value_parser = parse_method_query,
+        conflicts_with_all = ["class", "method", "field", "strings", "regexes", "inherits"]
+    )]
+    callers_of: Option<MethodQuery>,
+
+    /// Find classes that directly or indirectly extend or implement CLASS
+    #[arg(
+        long,
+        value_name = "CLASS",
+        value_parser = non_empty,
+        conflicts_with_all = ["class", "method", "field", "strings", "regexes", "callers_of"]
+    )]
+    inherits: Option<String>,
+
     /// Emit a JSON array
     #[arg(long)]
     json: bool,
@@ -75,6 +101,13 @@ struct OutputLocation {
     kind: char,
     location: String,
     source: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MethodQuery {
+    class: Option<String>,
+    method: String,
+    descriptor: Option<String>,
 }
 
 enum StringMatcher {
@@ -172,6 +205,13 @@ fn query_apk(
     strings: &[StringMatcher],
     mapping: Option<&Mapping>,
 ) -> Result<Vec<OutputLocation>, String> {
+    if let Some(query) = &cli.callers_of {
+        return query_callers(dex, query, mapping);
+    }
+    if let Some(class) = cli.inherits.as_deref() {
+        return query_inheritors(dex, class, mapping);
+    }
+
     let field_classes = cli
         .field
         .as_deref()
@@ -213,42 +253,94 @@ fn query_apk(
 
     let mut output = Vec::new();
     for method_id in method_ids {
-        let location = dex.location(method_id)?;
-        let dex_location = format!(
-            "{}->{}{}",
-            location.class, location.method, location.descriptor
-        );
-        let mapped = mapping
-            .into_iter()
-            .flat_map(|mapping| {
-                let class = mapping.original_class(location.class);
-                mapping
-                    .methods(location.class, location.method, location.descriptor)
-                    .iter()
-                    .filter_map(move |method| {
-                        class.map(|class| format!("{class}->{}{}", method.name, method.descriptor))
-                    })
-            })
-            .collect::<Vec<_>>();
-        if mapped.is_empty() {
-            output.push(OutputLocation {
-                file: location.dex.to_owned(),
-                kind: 'M',
-                location: dex_location,
-                source: location.source_file.map(str::to_owned),
-            });
-        } else {
-            for location_name in mapped {
-                output.push(OutputLocation {
-                    file: location.dex.to_owned(),
-                    kind: 'M',
-                    location: location_name,
-                    source: location.source_file.map(str::to_owned),
-                });
+        output.extend(method_output(&dex.location(method_id)?, mapping));
+    }
+    Ok(output)
+}
+
+fn query_callers(
+    dex: DexIndexView<'_>,
+    query: &MethodQuery,
+    mapping: Option<&Mapping>,
+) -> Result<Vec<OutputLocation>, String> {
+    let targets = if mapping.is_none() {
+        dex.called_methods_named(&query.method)?
+    } else {
+        0..dex.called_method_count()
+    };
+    let mut callers = HashSet::new();
+    for target_id in targets {
+        let target = dex.called_method(target_id)?;
+        if called_method_matches(&target, query, mapping) {
+            callers.extend(dex.callers(target_id)?);
+        }
+    }
+    let mut output = Vec::new();
+    for caller in callers {
+        output.extend(method_output(&dex.location(caller)?, mapping));
+    }
+    Ok(output)
+}
+
+fn query_inheritors(
+    dex: DexIndexView<'_>,
+    query: &str,
+    mapping: Option<&Mapping>,
+) -> Result<Vec<OutputLocation>, String> {
+    let mut children = HashMap::<String, Vec<usize>>::new();
+    let mut class_names = Vec::with_capacity(dex.class_count());
+    for class_id in 0..dex.class_count() {
+        let class = dex.class(class_id)?;
+        class_names.push(class.class.to_owned());
+        if let Some(superclass) = class.superclass {
+            children
+                .entry(superclass.to_owned())
+                .or_default()
+                .push(class_id);
+        }
+        for interface in dex.class_interfaces(class_id)? {
+            children
+                .entry(interface?.to_owned())
+                .or_default()
+                .push(class_id);
+        }
+    }
+
+    let roots = children
+        .keys()
+        .filter(|class| class_matches(class, query, mapping))
+        .cloned()
+        .collect::<Vec<_>>();
+    let matches = descendant_ids(&children, &class_names, roots);
+
+    let mut output = Vec::new();
+    for class_id in matches {
+        output.push(class_output(&dex.class(class_id)?, mapping));
+    }
+    Ok(output)
+}
+
+fn descendant_ids(
+    children: &HashMap<String, Vec<usize>>,
+    classes: &[String],
+    roots: impl IntoIterator<Item = String>,
+) -> HashSet<usize> {
+    let mut pending = roots.into_iter().collect::<VecDeque<_>>();
+    let mut visited = HashSet::new();
+    let mut matches = HashSet::new();
+    while let Some(parent) = pending.pop_front() {
+        if !visited.insert(parent.clone()) {
+            continue;
+        }
+        for &class_id in children.get(&parent).into_iter().flatten() {
+            if matches.insert(class_id)
+                && let Some(class) = classes.get(class_id)
+            {
+                pending.push_back(class.clone());
             }
         }
     }
-    Ok(output)
+    matches
 }
 
 fn query_classes(
@@ -260,15 +352,7 @@ fn query_classes(
     for class_id in 0..dex.class_count() {
         let location = dex.class(class_id)?;
         if class_matches(location.class, class, mapping) {
-            output.push(OutputLocation {
-                file: location.dex.to_owned(),
-                kind: 'C',
-                location: mapping
-                    .and_then(|mapping| mapping.original_class(location.class))
-                    .unwrap_or(location.class)
-                    .to_owned(),
-                source: location.source_file.map(str::to_owned),
-            });
+            output.push(class_output(&location, mapping));
         }
     }
     Ok(output)
@@ -390,6 +474,82 @@ fn method_matches(
         })
 }
 
+fn called_method_matches(
+    target: &CalledMethodRef<'_>,
+    query: &MethodQuery,
+    mapping: Option<&Mapping>,
+) -> bool {
+    method_query_matches(target.class, target.method, target.descriptor, query)
+        || mapping.is_some_and(|mapping| {
+            let Some(class) = mapping.original_class(target.class) else {
+                return false;
+            };
+            mapping
+                .methods(target.class, target.method, target.descriptor)
+                .iter()
+                .any(|method| method_query_matches(class, &method.name, &method.descriptor, query))
+        })
+}
+
+fn method_query_matches(class: &str, method: &str, descriptor: &str, query: &MethodQuery) -> bool {
+    method == query.method
+        && query
+            .class
+            .as_deref()
+            .is_none_or(|query| class_name_matches(class, query))
+        && query
+            .descriptor
+            .as_deref()
+            .is_none_or(|query| descriptor == query)
+}
+
+fn method_output(
+    location: &MethodLocationRef<'_>,
+    mapping: Option<&Mapping>,
+) -> Vec<OutputLocation> {
+    let mapped = mapping
+        .into_iter()
+        .flat_map(|mapping| {
+            let class = mapping.original_class(location.class);
+            mapping
+                .methods(location.class, location.method, location.descriptor)
+                .iter()
+                .filter_map(move |method| {
+                    class.map(|class| format!("{class}->{}{}", method.name, method.descriptor))
+                })
+        })
+        .collect::<Vec<_>>();
+    let names = if mapped.is_empty() {
+        vec![format!(
+            "{}->{}{}",
+            location.class, location.method, location.descriptor
+        )]
+    } else {
+        mapped
+    };
+    names
+        .into_iter()
+        .map(|name| OutputLocation {
+            file: location.dex.to_owned(),
+            kind: 'M',
+            location: name,
+            source: location.source_file.map(str::to_owned),
+        })
+        .collect()
+}
+
+fn class_output(location: &ClassLocationRef<'_>, mapping: Option<&Mapping>) -> OutputLocation {
+    OutputLocation {
+        file: location.dex.to_owned(),
+        kind: 'C',
+        location: mapping
+            .and_then(|mapping| mapping.original_class(location.class))
+            .unwrap_or(location.class)
+            .to_owned(),
+        source: location.source_file.map(str::to_owned),
+    }
+}
+
 fn field_matches(location: &FieldLocationRef<'_>, query: &str, mapping: Option<&Mapping>) -> bool {
     location.field == query
         || mapping.is_some_and(|mapping| {
@@ -466,12 +626,42 @@ fn non_empty(value: &str) -> Result<String, String> {
         .ok_or_else(|| "string query cannot be empty".to_owned())
 }
 
+fn parse_method_query(value: &str) -> Result<MethodQuery, String> {
+    let (class, member) = match value.split_once("->") {
+        Some((class, member)) if !class.is_empty() && !member.contains("->") => {
+            (Some(class.to_owned()), member)
+        }
+        Some(_) => return Err("method query must use CLASS->NAME(DESCRIPTOR)".to_owned()),
+        None => (None, value),
+    };
+    let (method, descriptor) = match member.find('(') {
+        Some(open) if open > 0 && member[open..].contains(')') => {
+            (&member[..open], Some(member[open..].to_owned()))
+        }
+        Some(_) => return Err("method query has an invalid descriptor".to_owned()),
+        None => (member, None),
+    };
+    if method.is_empty() {
+        return Err("method name cannot be empty".to_owned());
+    }
+    Ok(MethodQuery {
+        class,
+        method: method.to_owned(),
+        descriptor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use clap::Parser;
     use serde_json::json;
 
-    use super::{Cli, OutputLocation, class_matches, string_matchers, unique_strings};
+    use super::{
+        Cli, MethodQuery, OutputLocation, class_matches, descendant_ids, parse_method_query,
+        string_matchers, unique_strings,
+    };
 
     #[test]
     fn parses_the_compact_query_syntax() {
@@ -504,6 +694,66 @@ mod tests {
         assert!(
             Cli::try_parse_from(["dexq", "app.apk", "-m", "someMethod", "--aligned", "--json"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_relationship_queries() {
+        let callers = Cli::try_parse_from([
+            "dexq",
+            "app.apk",
+            "--callers-of",
+            "Lexample/Target;->work(I)V",
+        ])
+        .unwrap();
+        assert_eq!(
+            callers.callers_of,
+            Some(MethodQuery {
+                class: Some("Lexample/Target;".to_owned()),
+                method: "work".to_owned(),
+                descriptor: Some("(I)V".to_owned()),
+            })
+        );
+        assert!(Cli::try_parse_from(["dexq", "app.apk", "--inherits", "Base"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "dexq",
+                "app.apk",
+                "--callers-of",
+                "work",
+                "--inherits",
+                "Base"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_bare_and_qualified_method_queries() {
+        assert_eq!(
+            parse_method_query("work").unwrap(),
+            MethodQuery {
+                class: None,
+                method: "work".to_owned(),
+                descriptor: None,
+            }
+        );
+        assert!(parse_method_query("Target->").is_err());
+        assert!(parse_method_query("work(").is_err());
+    }
+
+    #[test]
+    fn finds_transitive_descendants_once() {
+        let children = HashMap::from([
+            ("LBase;".to_owned(), vec![0]),
+            ("LChild;".to_owned(), vec![1]),
+            ("LGrandchild;".to_owned(), vec![0]),
+        ]);
+        let classes = ["LChild;".to_owned(), "LGrandchild;".to_owned()];
+
+        assert_eq!(
+            descendant_ids(&children, &classes, ["LBase;".to_owned()]),
+            HashSet::from([0, 1])
         );
     }
 
