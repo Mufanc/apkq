@@ -4,8 +4,6 @@ use std::io::{Cursor, Read};
 
 use zip::ZipArchive;
 
-const MAX_MAPPING_BYTES: u64 = 512 * 1024 * 1024;
-
 #[derive(Debug)]
 pub struct Mapping {
     classes: HashMap<String, ClassMapping>,
@@ -27,22 +25,27 @@ pub struct MemberMapping {
 impl Mapping {
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut names = HashMap::new();
+
         for line in text.lines() {
             if let Some((original, obfuscated)) = parse_class_line(line) {
                 names.insert(original.to_owned(), obfuscated.to_owned());
             }
         }
+
         if names.is_empty() {
             return Err("mapping contains no class mappings".to_owned());
         }
 
         let mut classes = HashMap::new();
         let mut current_class = None;
+
         for (line_number, line) in text.lines().enumerate() {
             let trimmed = line.trim();
+
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
+
             if let Some((original, obfuscated)) = parse_class_line(line) {
                 let descriptor = type_descriptor(obfuscated, None)?;
                 classes.insert(
@@ -56,6 +59,7 @@ impl Mapping {
                 current_class = Some(descriptor);
                 continue;
             }
+
             if !line.starts_with(char::is_whitespace) {
                 return Err(format!("invalid class mapping at line {}", line_number + 1));
             }
@@ -66,6 +70,7 @@ impl Mapping {
             let class = classes
                 .get_mut(class)
                 .expect("current mapping class was just inserted");
+
             parse_member(trimmed, &names, class)
                 .map_err(|error| format!("{error} at line {}", line_number + 1))?;
         }
@@ -76,6 +81,7 @@ impl Mapping {
                 members.dedup();
             }
         }
+
         Ok(Self { classes })
     }
 
@@ -107,44 +113,41 @@ pub fn load(spec: &str) -> Result<Mapping, String> {
         if entry.is_empty() {
             return Err("mapping ZIP entry cannot be empty".to_owned());
         }
+
         if entry.contains('!') {
             return Err("nested mapping archives are not supported".to_owned());
         }
+
         let bytes = fs::read(archive).map_err(|error| format!("{archive}: {error}"))?;
         read_zip_entry(&bytes, archive, entry)?
     } else {
         fs::read(spec).map_err(|error| format!("{spec}: {error}"))?
     };
+
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| format!("mapping is not valid UTF-8: {error}"))?;
+
     Mapping::parse(text)
 }
 
 fn read_zip_entry(bytes: &[u8], archive: &str, entry: &str) -> Result<Vec<u8>, String> {
     let mut zip = ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| format!("invalid mapping ZIP {archive}: {error}"))?;
-    let file = zip
+    let mut file = zip
         .by_name(entry)
         .map_err(|error| format!("{archive}!{entry}: {error}"))?;
-    if file.size() > MAX_MAPPING_BYTES {
-        return Err(format!(
-            "mapping ZIP entry is too large: {} bytes",
-            file.size()
-        ));
-    }
-    let mut output = Vec::with_capacity(file.size() as usize);
-    file.take(MAX_MAPPING_BYTES + 1)
-        .read_to_end(&mut output)
+
+    let mut output = Vec::new();
+    file.read_to_end(&mut output)
         .map_err(|error| format!("{archive}!{entry}: {error}"))?;
-    if output.len() as u64 > MAX_MAPPING_BYTES {
-        return Err("mapping ZIP entry exceeded the size limit".to_owned());
-    }
+
     if output.starts_with(b"PK\x03\x04")
         || output.starts_with(b"PK\x05\x06")
         || output.starts_with(b"PK\x07\x08")
     {
         return Err("nested mapping archives are not supported".to_owned());
     }
+
     Ok(output)
 }
 
@@ -152,7 +155,9 @@ fn parse_class_line(line: &str) -> Option<(&str, &str)> {
     if line.starts_with(char::is_whitespace) {
         return None;
     }
+
     let (original, obfuscated) = line.split_once(" -> ")?;
+
     Some((original.trim(), obfuscated.trim().strip_suffix(':')?))
 }
 
@@ -165,6 +170,7 @@ fn parse_member(
         .split_once(" -> ")
         .ok_or_else(|| "invalid member mapping".to_owned())?;
     let original = strip_line_prefix(original);
+
     if let Some(open) = original.find('(') {
         let close = original[open + 1..]
             .find(')')
@@ -177,6 +183,7 @@ fn parse_member(
         let parameters = &original[open + 1..close];
         let original_descriptor = method_descriptor(return_type, parameters, None)?;
         let obfuscated_descriptor = method_descriptor(return_type, parameters, Some(names))?;
+
         class
             .methods
             .entry(member_key(obfuscated.trim(), &obfuscated_descriptor))
@@ -192,6 +199,7 @@ fn parse_member(
             .ok_or_else(|| "invalid field mapping".to_owned())?;
         let original_descriptor = type_descriptor(field_type, None)?;
         let obfuscated_descriptor = type_descriptor(field_type, Some(names))?;
+
         class
             .fields
             .entry(member_key(obfuscated.trim(), &obfuscated_descriptor))
@@ -201,6 +209,7 @@ fn parse_member(
                 descriptor: original_descriptor,
             });
     }
+
     Ok(())
 }
 
@@ -208,9 +217,11 @@ fn strip_line_prefix(value: &str) -> &str {
     let Some((start, rest)) = value.split_once(':') else {
         return value;
     };
+
     let Some((end, signature)) = rest.split_once(':') else {
         return value;
     };
+
     if start.chars().all(|character| character.is_ascii_digit())
         && end.chars().all(|character| character.is_ascii_digit())
     {
@@ -226,13 +237,16 @@ fn method_descriptor(
     names: Option<&HashMap<String, String>>,
 ) -> Result<String, String> {
     let mut descriptor = String::from("(");
+
     if !parameters.trim().is_empty() {
         for parameter in parameters.split(',') {
             descriptor.push_str(&type_descriptor(parameter, names)?);
         }
     }
+
     descriptor.push(')');
     descriptor.push_str(&type_descriptor(return_type, names)?);
+
     Ok(descriptor)
 }
 
@@ -242,10 +256,12 @@ fn type_descriptor(
 ) -> Result<String, String> {
     let mut type_name = type_name.trim();
     let mut dimensions = 0;
+
     while let Some(element) = type_name.strip_suffix("[]") {
         type_name = element;
         dimensions += 1;
     }
+
     let base = match type_name {
         "void" => "V".to_owned(),
         "boolean" => "Z".to_owned(),
@@ -265,6 +281,7 @@ fn type_descriptor(
             format!("L{};", class.replace('.', "/"))
         }
     };
+
     Ok(format!("{}{}", "[".repeat(dimensions), base))
 }
 
