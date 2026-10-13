@@ -16,7 +16,21 @@ mod output;
 use output::{Row, print_output, push_aliases};
 
 #[derive(Parser)]
-#[command(name = "dexq", about = "Query Android APKs directly")]
+#[command(
+    name = "dexq",
+    about = "Query Android APKs directly",
+    after_help = r#"Examples:
+  dexq c app.apk --name com.example.MainActivity
+  dexq f app.apk --class com.example.Config --name apiKey
+  dexq m app.apk --uses-string token
+  dexq m ./apks --mapping 'mapping.zip!path/to/mapping.txt' --json
+
+Input: an APK or a directory searched recursively for APKs; nested APKs are searched too. Standalone DEX, JAR and AAR files are unsupported.
+Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Columns: APK path, DEX entry, TYPE (C/F/M), DEX DESCRIPTOR, ORIGINAL mapped name, SOURCE file.
+Mapping: --mapping mapping.txt or --mapping 'mapping.zip!path/to/mapping.txt'. Mapped class/member names can be used in queries and appear in output.
+Scope: DEX definitions and explicit code references; no decompilation, reflection or runtime-generated strings.
+Run 'dexq <command> --help' for query syntax."#
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -27,8 +41,10 @@ struct Common {
     /// R8/ProGuard mapping file, or ZIP entry as archive.zip!path/to/mapping.txt
     #[arg(long, value_name = "FILE[!ENTRY]")]
     mapping: Option<String>,
+    /// Emit a JSON array instead of TSV
     #[arg(long)]
     json: bool,
+    /// Align text columns instead of TSV
     #[arg(long, conflicts_with = "json")]
     aligned: bool,
 }
@@ -36,12 +52,30 @@ struct Common {
 #[derive(Subcommand)]
 enum Command {
     /// Find class definitions
-    #[command(visible_alias = "c")]
+    #[command(
+        visible_alias = "c",
+        after_help = r#"With no filters, list all classes. Use full dotted names, not DEX descriptors.
+--name is exact; use a trailing dot in --name-prefix for a package.
+--inherits finds direct and transitive subclasses and implementors; the base class is excluded.
+Filters are ANDed. With --mapping, class filters also match original names.
+
+Examples:
+  dexq c app.apk --name com.example.MainActivity
+  dexq c app.apk --name-prefix com.example.
+  dexq c app.apk --inherits android.app.Activity
+  dexq c app.apk --mapping mapping.txt --inherits com.example.ItemBase"#
+    )]
     Classes {
+        /// APK file or directory to search recursively
         input: PathBuf,
+        /// Exact class name
         #[arg(long, value_parser = query::parse_class)]
         name: Option<String>,
-        #[arg(long = "name-prefix", value_parser = query::parse_class_prefix)]
+        #[arg(
+            long = "name-prefix",
+            value_parser = query::parse_class_prefix,
+            help = "Class name prefix, such as com.example."
+        )]
         name_prefix: Option<String>,
         /// Direct or transitive subclasses and implementors
         #[arg(long, value_parser = query::parse_class)]
@@ -50,22 +84,58 @@ enum Command {
         common: Common,
     },
     /// Find field definitions
-    #[command(visible_alias = "f")]
+    #[command(
+        visible_alias = "f",
+        after_help = r#"With no filters, list all fields. --class takes a full dotted class name; --name matches an exact field name. Both filters are ANDed.
+With --mapping, filters also match original class and field names.
+
+Examples:
+  dexq f app.apk --class com.example.Config --name apiKey
+  dexq f ./apks --name apiKey --json
+  dexq f app.apk --mapping mapping.txt --name originalField"#
+    )]
     Fields {
+        /// APK file or directory to search recursively
         input: PathBuf,
+        /// Exact declaring class name
         #[arg(long, value_parser = query::parse_class)]
         class: Option<String>,
+        /// Exact field name
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
         common: Common,
     },
     /// Find method definitions; repeated reference filters are ANDed within one method
-    #[command(visible_alias = "m")]
+    #[command(
+        visible_alias = "m",
+        after_help = r#"With no filters, list all methods. --class takes a full dotted class name; --name is exact; --has-field requires a field declared in that class.
+All filters are ANDed. Repeated reference options require references within the same method.
+--uses-string matches case-sensitive substrings, including reads of initialized static string fields.
+--calls Class#name matches any overload; add (parameters):returnType for an exact signature.
+--uses-field Class#name matches any type; add :type to specify one.
+Types use Java syntax: int, java.lang.String[], etc.
+With --mapping, class/member filters also match original names.
+Calls are explicit DEX invokes, not reflection or runtime dispatch targets.
+
+Examples:
+  dexq m app.apk --name onCreate
+  dexq m app.apk --class com.example.MainActivity --has-field apiKey
+  dexq m app.apk --uses-string token --uses-string secret
+  dexq m app.apk --calls 'com.example.Client#send'
+  dexq m app.apk --calls 'com.example.Client#send(int):void'
+  dexq m app.apk --uses-field 'com.example.Config#key'
+  dexq m app.apk --uses-field 'com.example.Config#key:java.lang.String'
+  dexq m app.apk --uses-string token --uses-type java.lang.String
+  dexq m app.apk --mapping mapping.txt --calls 'com.example.Client#send'"#
+    )]
     Methods {
+        /// APK file or directory to search recursively
         input: PathBuf,
+        /// Exact declaring class name
         #[arg(long, value_parser = query::parse_class)]
         class: Option<String>,
+        /// Exact method name
         #[arg(long)]
         name: Option<String>,
         /// Keep methods declared in classes with a field of this name
