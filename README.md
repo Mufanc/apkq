@@ -11,24 +11,24 @@ cargo build --release
 ## Queries
 
 ```sh
-dexq classes app.apk --name com.example.MainActivity
-dexq c app.apk --name-prefix com.example.
-dexq c app.apk --inherits android.app.Activity
-dexq fields app.apk --class com.example.Config --name apiKey
-dexq f app.apk --name apiKey
-dexq methods app.apk --name onCreate
-dexq m app.apk --uses-string token --uses-string secret
-dexq m app.apk --calls 'com.example.Client#send'
-dexq m app.apk --calls 'com.example.Client#send(int):void'
-dexq m app.apk --uses-type com.example.Secret
-dexq m app.apk --uses-field 'com.example.Config#apiKey:java.lang.String'
-dexq r app.apk --type string --value 'Login failed'
-dexq r app.apk --type string --value-regex 'login|sign.?in'
-dexq r app.apk --type id --name-contains button
-dexq r app.apk --type layout --name activity_login
-dexq r app.apk --id 0x7f0a0012
-dexq r app.apk --type layout --uses-resource string/login_failed
-dexq r app.apk --type layout --uses-resource 0x7f0a0012 --json
+dexq app.apk classes --name com.example.MainActivity
+dexq app.apk c --name-prefix com.example.
+dexq app.apk c --inherits android.app.Activity
+dexq app.apk fields --class com.example.Config --name apiKey
+dexq app.apk f --name apiKey
+dexq app.apk methods --name onCreate
+dexq app.apk m --uses-string token --uses-string secret
+dexq app.apk m --calls 'com.example.Client#send'
+dexq app.apk m --calls 'com.example.Client#send(int):void'
+dexq app.apk m --uses-type com.example.Secret
+dexq app.apk m --uses-field 'com.example.Config#apiKey:java.lang.String'
+dexq app.apk r --type string --value 'Login failed'
+dexq app.apk r --type string --value-regex 'login|sign.?in'
+dexq app.apk r --type id --name-contains button
+dexq app.apk r --type layout --name activity_login
+dexq app.apk r --id 0x7f0a0012
+dexq app.apk r --type layout --uses-resource string/login_failed
+dexq app.apk --json r --type layout --uses-resource 0x7f0a0012
 ```
 
 `c`, `f`, `m`, and `r` are aliases for `classes`, `fields`, `methods`, and `resources`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
@@ -37,10 +37,10 @@ dexq r app.apk --type layout --uses-resource 0x7f0a0012 --json
 
 All filters in a command are combined with AND. In `methods`, every reference filter must match within the **same method**. Repeat `--uses-string` for multiple string fragments. String matching is case-sensitive substring matching and includes reads of static string fields initialized in DEX. Query types use dotted Java names (`com.example.Client`, `int`, `java.lang.String[]`). Members use `Class#name`; `--calls` may add `(parameterTypes):returnType` for an exact signature, and `--uses-field` may add `:type`. Without a signature or type, all members with that class and name match. `methods --has-field` keeps methods whose declaring class defines the named field. `--name` is an exact class, method, or field name. `classes --inherits` includes direct and transitive subclasses and interface implementors.
 
-The default output is TSV. Code queries include APK, DEX entry, kind, descriptor, original mapped name, and source file. Resource queries include APK, nested archive path, ID, package, type, name, configuration, value, file path, and reference location. Use `--aligned` for space-aligned text or `--json` for an array of objects. Timing and match count are printed to stderr. Supply an R8/ProGuard mapping file, or an entry in a ZIP, to search original code names and include them in results:
+The default output is TSV. Code queries include APK, DEX entry, kind, descriptor, optional original mapped name, and source file. Resource queries include APK, nested archive path, ID, type, name, configuration, value, file path, and usage. Use `--aligned` for space-aligned text or `--json` for an array of objects. Timing and match count are printed to stderr. Supply a mapping file, or an entry in a ZIP, to search mapped names. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings:
 
 ```sh
-dexq m app.apk --mapping 'mappings.zip!release/mapping.txt' --name originalMethod --json
+dexq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name originalMethod
 ```
 
 ## Search semantics
