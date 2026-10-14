@@ -1,4 +1,4 @@
-use dexq::resource::Location;
+use apkq::resource::Location;
 use serde_json::json;
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]

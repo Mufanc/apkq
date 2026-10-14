@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
+use apkq::dex::mapping::{self, Mapping};
+use apkq::dex::{self, DexIndex, ReferenceFilter};
+use apkq::query::{self, CallQuery, FieldQuery};
+use apkq::resource::{self, Query};
 use clap::{Parser, Subcommand};
-use dexq::dex::mapping::{self, Mapping};
-use dexq::dex::{self, DexIndex, ReferenceFilter};
-use dexq::query::{self, CallQuery, FieldQuery};
-use dexq::resource::{self, Query};
 use regex::Regex;
 
 mod output;
@@ -18,21 +18,21 @@ use output::{Row, print_output, print_resources, push_aliases};
 
 #[derive(Parser)]
 #[command(
-    name = "dexq",
+    name = "apkq",
     about = "Query Android APKs directly",
     after_help = r#"Examples:
-  dexq app.apk c --name com.example.MainActivity
-  dexq app.apk f --class com.example.Config --name apiKey
-  dexq app.apk m --uses-string token
-  dexq app.apk r --type string --value 'Login failed'
-  dexq app.apk r --type layout --uses-resource string/login_failed
-  dexq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
+  apkq app.apk c --name com.example.MainActivity
+  apkq app.apk f --class com.example.Config --name apiKey
+  apkq app.apk m --uses-string token
+  apkq app.apk r --type string --value 'Login failed'
+  apkq app.apk r --type layout --uses-resource string/login_failed
+  apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
 Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), DESCRIPTOR, optional ORIGINAL, and SOURCE. Resource rows contain APK, nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
 Mapping: --mapping accepts a file or 'archive.zip!entry'. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings.
 Search covers DEX definitions and references, compiled resource values, and XML attributes.
-Run 'dexq <apk> <command> --help' for query syntax."#
+Run 'apkq <apk> <command> --help' for query syntax."#
 )]
 struct Cli {
     /// APK file to search
@@ -60,13 +60,13 @@ enum Command {
 --uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. USAGE identifies the table value or XML view ID and attribute.
 
 Examples:
-  dexq app.apk r --type string --value 'Login failed'
-  dexq app.apk r --type string --value-regex 'login|sign.?in'
-  dexq app.apk r --type id --name-contains button
-  dexq app.apk r --type layout --name activity_login
-  dexq app.apk r --id 0x7f0a0012
-  dexq app.apk r --type layout --uses-resource string/login_failed
-  dexq app.apk --json r --type layout --uses-resource 0x7f0a0012"#
+  apkq app.apk r --type string --value 'Login failed'
+  apkq app.apk r --type string --value-regex 'login|sign.?in'
+  apkq app.apk r --type id --name-contains button
+  apkq app.apk r --type layout --name activity_login
+  apkq app.apk r --id 0x7f0a0012
+  apkq app.apk r --type layout --uses-resource string/login_failed
+  apkq app.apk --json r --type layout --uses-resource 0x7f0a0012"#
     )]
     Resources {
         /// Exact resource type, such as string, id, or layout
@@ -100,10 +100,10 @@ Examples:
 Filters are ANDed. With --mapping, class filters also match original names.
 
 Examples:
-  dexq app.apk c --name com.example.MainActivity
-  dexq app.apk c --name-prefix com.example.
-  dexq app.apk c --inherits android.app.Activity
-  dexq app.apk --mapping mapping.txt c --inherits com.example.ItemBase"#
+  apkq app.apk c --name com.example.MainActivity
+  apkq app.apk c --name-prefix com.example.
+  apkq app.apk c --inherits android.app.Activity
+  apkq app.apk --mapping mapping.txt c --inherits com.example.ItemBase"#
     )]
     Classes {
         /// Exact class name
@@ -126,9 +126,9 @@ Examples:
 With --mapping, filters also match original class and field names.
 
 Examples:
-  dexq app.apk f --class com.example.Config --name apiKey
-  dexq app.apk --json f --name apiKey
-  dexq app.apk --mapping mapping.txt f --name originalField"#
+  apkq app.apk f --class com.example.Config --name apiKey
+  apkq app.apk --json f --name apiKey
+  apkq app.apk --mapping mapping.txt f --name originalField"#
     )]
     Fields {
         /// Exact declaring class name
@@ -151,15 +151,15 @@ With --mapping, class/member filters also match original names.
 Calls match explicit DEX invoke instructions.
 
 Examples:
-  dexq app.apk m --name onCreate
-  dexq app.apk m --class com.example.MainActivity --has-field apiKey
-  dexq app.apk m --uses-string token --uses-string secret
-  dexq app.apk m --calls 'com.example.Client#send'
-  dexq app.apk m --calls 'com.example.Client#send(int):void'
-  dexq app.apk m --uses-field 'com.example.Config#key'
-  dexq app.apk m --uses-field 'com.example.Config#key:java.lang.String'
-  dexq app.apk m --uses-string token --uses-type java.lang.String
-  dexq app.apk --mapping mapping.txt m --calls 'com.example.Client#send'"#
+  apkq app.apk m --name onCreate
+  apkq app.apk m --class com.example.MainActivity --has-field apiKey
+  apkq app.apk m --uses-string token --uses-string secret
+  apkq app.apk m --calls 'com.example.Client#send'
+  apkq app.apk m --calls 'com.example.Client#send(int):void'
+  apkq app.apk m --uses-field 'com.example.Config#key'
+  apkq app.apk m --uses-field 'com.example.Config#key:java.lang.String'
+  apkq app.apk m --uses-string token --uses-type java.lang.String
+  apkq app.apk --mapping mapping.txt m --calls 'com.example.Client#send'"#
     )]
     Methods {
         /// Exact declaring class name
@@ -534,25 +534,25 @@ mod tests {
     #[test]
     fn accepts_short_command_aliases_and_combined_filters() {
         let cli =
-            Cli::try_parse_from(["dexq", "app.apk", "--mapping", "mapping.txt", "--json", "m"])
+            Cli::try_parse_from(["apkq", "app.apk", "--mapping", "mapping.txt", "--json", "m"])
                 .unwrap();
         assert!(cli.mapping.is_some() && cli.json);
-        assert!(Cli::try_parse_from(["dexq", "app.apk", "r", "--aligned"]).is_ok());
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--aligned"]).is_ok());
 
         assert!(matches!(
-            Cli::try_parse_from(["dexq", "app.apk", "c", "--inherits", "com.example.Base"])
+            Cli::try_parse_from(["apkq", "app.apk", "c", "--inherits", "com.example.Base"])
                 .unwrap()
                 .command,
             Command::Classes { .. }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["dexq", "app.apk", "f", "--name", "apiKey"])
+            Cli::try_parse_from(["apkq", "app.apk", "f", "--name", "apiKey"])
                 .unwrap()
                 .command,
             Command::Fields { .. }
         ));
         let cli = Cli::try_parse_from([
-            "dexq",
+            "apkq",
             "app.apk",
             "m",
             "--uses-string",
@@ -566,15 +566,15 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Methods { strings, types, .. } if strings.len() == 2 && types.len() == 1)
         );
-        assert!(Cli::try_parse_from(["dexq", "app.apk", "m", "--string", "legacy"]).is_ok());
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "m", "--string", "legacy"]).is_ok());
         assert!(
-            Cli::try_parse_from(["dexq", "app.apk", "m", "--calls", "com.example.Client#send"])
+            Cli::try_parse_from(["apkq", "app.apk", "m", "--calls", "com.example.Client#send"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["dexq", "app.apk", "c", "--inherits", "LBase;"]).is_err());
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "c", "--inherits", "LBase;"]).is_err());
         assert!(matches!(
             Cli::try_parse_from([
-                "dexq",
+                "apkq",
                 "app.apk",
                 "r",
                 "--type",
@@ -590,9 +590,9 @@ mod tests {
                 ..
             }
         ));
-        assert!(Cli::try_parse_from(["dexq", "app.apk", "r", "--id", "0x7f0a0012"]).is_ok());
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--id", "0x7f0a0012"]).is_ok());
         assert!(
-            Cli::try_parse_from(["dexq", "app.apk", "r", "--uses-resource", "broken"]).is_err()
+            Cli::try_parse_from(["apkq", "app.apk", "r", "--uses-resource", "broken"]).is_err()
         );
     }
 }

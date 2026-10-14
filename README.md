@@ -1,6 +1,6 @@
-# dexq
+# apkq
 
-`dexq` searches Android APKs directly. It reads DEX metadata, scans method bytecode, and queries compiled Android resources.
+`apkq` searches Android APKs directly. It reads DEX metadata, scans method bytecode, and queries compiled Android resources.
 
 ## Build
 
@@ -11,24 +11,24 @@ cargo build --release
 ## Queries
 
 ```sh
-dexq app.apk classes --name com.example.MainActivity
-dexq app.apk c --name-prefix com.example.
-dexq app.apk c --inherits android.app.Activity
-dexq app.apk fields --class com.example.Config --name apiKey
-dexq app.apk f --name apiKey
-dexq app.apk methods --name onCreate
-dexq app.apk m --uses-string token --uses-string secret
-dexq app.apk m --calls 'com.example.Client#send'
-dexq app.apk m --calls 'com.example.Client#send(int):void'
-dexq app.apk m --uses-type com.example.Secret
-dexq app.apk m --uses-field 'com.example.Config#apiKey:java.lang.String'
-dexq app.apk r --type string --value 'Login failed'
-dexq app.apk r --type string --value-regex 'login|sign.?in'
-dexq app.apk r --type id --name-contains button
-dexq app.apk r --type layout --name activity_login
-dexq app.apk r --id 0x7f0a0012
-dexq app.apk r --type layout --uses-resource string/login_failed
-dexq app.apk --json r --type layout --uses-resource 0x7f0a0012
+apkq app.apk classes --name com.example.MainActivity
+apkq app.apk c --name-prefix com.example.
+apkq app.apk c --inherits android.app.Activity
+apkq app.apk fields --class com.example.Config --name apiKey
+apkq app.apk f --name apiKey
+apkq app.apk methods --name onCreate
+apkq app.apk m --uses-string token --uses-string secret
+apkq app.apk m --calls 'com.example.Client#send'
+apkq app.apk m --calls 'com.example.Client#send(int):void'
+apkq app.apk m --uses-type com.example.Secret
+apkq app.apk m --uses-field 'com.example.Config#apiKey:java.lang.String'
+apkq app.apk r --type string --value 'Login failed'
+apkq app.apk r --type string --value-regex 'login|sign.?in'
+apkq app.apk r --type id --name-contains button
+apkq app.apk r --type layout --name activity_login
+apkq app.apk r --id 0x7f0a0012
+apkq app.apk r --type layout --uses-resource string/login_failed
+apkq app.apk --json r --type layout --uses-resource 0x7f0a0012
 ```
 
 `c`, `f`, `m`, and `r` are aliases for `classes`, `fields`, `methods`, and `resources`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
@@ -40,7 +40,7 @@ All filters in a command are combined with AND. In `methods`, every reference fi
 The default output is TSV. Code queries include APK, DEX entry, kind, descriptor, optional original mapped name, and source file. Resource queries include APK, nested archive path, ID, type, name, configuration, value, file path, and usage. Use `--aligned` for space-aligned text or `--json` for an array of objects. Timing and match count are printed to stderr. Supply a mapping file, or an entry in a ZIP, to search mapped names. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings:
 
 ```sh
-dexq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name originalMethod
+apkq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name originalMethod
 ```
 
 ## Search semantics
