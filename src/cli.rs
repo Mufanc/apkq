@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
@@ -27,12 +26,12 @@ use output::{Row, print_output, print_resources, push_aliases};
   dexq m app.apk --uses-string token
   dexq r app.apk --type string --value 'Login failed'
   dexq r app.apk --type layout --uses-resource string/login_failed
-  dexq m ./apks --mapping 'mapping.zip!path/to/mapping.txt' --json
+  dexq m app.apk --mapping 'mapping.zip!path/to/mapping.txt' --name originalMethod --json
 
-Input: an APK or a directory searched recursively for APKs; nested APKs are searched too. Standalone DEX, JAR and AAR files are unsupported.
+Input: an APK; embedded APKs are searched recursively.
 Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), DESCRIPTOR, optional ORIGINAL, and SOURCE. Resource rows contain APK, nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
-Mapping: --mapping mapping.txt or --mapping 'mapping.zip!path/to/mapping.txt'. Mapped class/member names can be used in queries and appear in output.
-Scope: DEX definitions, explicit code references, compiled resource values and XML attributes; no decompilation, reflection or runtime-generated strings.
+Mapping: --mapping accepts a file or 'archive.zip!entry'. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings.
+Search covers DEX definitions and references, compiled resource values, and XML attributes.
 Run 'dexq <command> --help' for query syntax."#
 )]
 struct Cli {
@@ -73,7 +72,7 @@ enum Command {
         visible_alias = "r",
         after_help = r#"Resources are read from resources.arsc in each APK, including embedded APKs. IDs are scoped to their containing APK.
 --type limits returned resource types, for example string, id, or layout. --name is exact; --name-contains and --value are case-sensitive substrings. --value-regex uses Rust regex syntax. Filters are ANDed.
---uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. USAGE identifies the table value or XML view ID and attribute. It does not scan DEX code or resolve runtime references.
+--uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. USAGE identifies the table value or XML view ID and attribute.
 
 Examples:
   dexq r app.apk --type string --value 'Login failed'
@@ -85,7 +84,7 @@ Examples:
   dexq r app.apk --type layout --uses-resource 0x7f0a0012 --json"#
     )]
     Resources {
-        /// APK file or directory to search recursively
+        /// APK file to search
         input: PathBuf,
         /// Exact resource type, such as string, id, or layout
         #[arg(long = "type", value_parser = non_empty)]
@@ -126,7 +125,7 @@ Examples:
   dexq c app.apk --mapping mapping.txt --inherits com.example.ItemBase"#
     )]
     Classes {
-        /// APK file or directory to search recursively
+        /// APK file to search
         input: PathBuf,
         /// Exact class name
         #[arg(long, value_parser = query::parse_class)]
@@ -151,11 +150,11 @@ With --mapping, filters also match original class and field names.
 
 Examples:
   dexq f app.apk --class com.example.Config --name apiKey
-  dexq f ./apks --name apiKey --json
+  dexq f app.apk --name apiKey --json
   dexq f app.apk --mapping mapping.txt --name originalField"#
     )]
     Fields {
-        /// APK file or directory to search recursively
+        /// APK file to search
         input: PathBuf,
         /// Exact declaring class name
         #[arg(long, value_parser = query::parse_class)]
@@ -176,7 +175,7 @@ All filters are ANDed. Repeated reference options require references within the 
 --uses-field Class#name matches any type; add :type to specify one.
 Types use Java syntax: int, java.lang.String[], etc.
 With --mapping, class/member filters also match original names.
-Calls are explicit DEX invokes, not reflection or runtime dispatch targets.
+Calls match explicit DEX invoke instructions.
 
 Examples:
   dexq m app.apk --name onCreate
@@ -190,7 +189,7 @@ Examples:
   dexq m app.apk --mapping mapping.txt --calls 'com.example.Client#send'"#
     )]
     Methods {
-        /// APK file or directory to search recursively
+        /// APK file to search
         input: PathBuf,
         /// Exact declaring class name
         #[arg(long, value_parser = query::parse_class)]
@@ -272,178 +271,175 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Resources { .. } => unreachable!(),
     };
 
-    let apks = collect_apks(input)?;
+    let apk = validate_apk(input)?;
     let mapping = common.mapping.as_deref().map(mapping::load).transpose()?;
     let mut output = Vec::new();
     let started = Instant::now();
 
-    for apk in apks {
-        let filter = match &cli.command {
-            Command::Methods {
+    let filter = match &cli.command {
+        Command::Methods {
+            strings,
+            calls,
+            types,
+            fields,
+            ..
+        } if !strings.is_empty()
+            || !calls.is_empty()
+            || !types.is_empty()
+            || !fields.is_empty() =>
+        {
+            Some(ReferenceFilter {
                 strings,
                 calls,
                 types,
                 fields,
-                ..
-            } if !strings.is_empty()
-                || !calls.is_empty()
-                || !types.is_empty()
-                || !fields.is_empty() =>
-            {
-                Some(ReferenceFilter {
-                    strings,
-                    calls,
-                    types,
-                    fields,
-                    mapping: mapping.as_ref(),
-                })
-            }
-            _ => None,
-        };
-        let index = dex::index_apk(&apk, filter.as_ref())?;
-        let apk_name = apk.to_string_lossy();
-
-        match &cli.command {
-            Command::Classes {
-                name,
-                name_prefix,
-                inherits,
-                ..
-            } => {
-                let descendants = inherits
-                    .as_deref()
-                    .map(|parent| inheritors(&index, parent, mapping.as_ref()));
-
-                for class in &index.classes {
-                    if name
-                        .as_deref()
-                        .is_some_and(|name| !class_matches(&class.class, name, mapping.as_ref()))
-                        || name_prefix.as_deref().is_some_and(|prefix| {
-                            !class.class.starts_with(prefix)
-                                && !mapping
-                                    .as_ref()
-                                    .and_then(|mapping| mapping.original_class(&class.class))
-                                    .is_some_and(|name| name.starts_with(prefix))
-                        })
-                        || descendants
-                            .as_ref()
-                            .is_some_and(|descendants| !descendants.contains(class.class.as_str()))
-                    {
-                        continue;
-                    }
-
-                    output.push(Row {
-                        apk: apk_name.to_string(),
-                        dex: class.dex.clone(),
-                        kind: 'C',
-                        descriptor: class.class.clone(),
-                        original: mapping
-                            .as_ref()
-                            .and_then(|mapping| mapping.original_class(&class.class))
-                            .map(str::to_owned),
-                        source: class.source_file.clone(),
-                    });
-                }
-            }
-            Command::Fields { class, name, .. } => {
-                for field in &index.fields {
-                    if class
-                        .as_deref()
-                        .is_some_and(|class| !class_matches(&field.class, class, mapping.as_ref()))
-                        || name
-                            .as_deref()
-                            .is_some_and(|name| !field_name_matches(field, name, mapping.as_ref()))
-                    {
-                        continue;
-                    }
-
-                    let descriptor =
-                        format!("{}->{}:{}", field.class, field.field, field.descriptor);
-                    let originals = mapping
-                        .as_ref()
-                        .map(|mapping| {
-                            mapping
-                                .fields(&field.class, &field.field, &field.descriptor)
-                                .iter()
-                                .filter_map(|alias| {
-                                    mapping.original_class(&field.class).map(|owner| {
-                                        format!("{owner}->{}:{}", alias.name, alias.descriptor)
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-
-                    push_aliases(
-                        &mut output,
-                        &apk_name,
-                        &field.dex,
-                        'F',
-                        descriptor,
-                        originals,
-                        field.source_file.as_deref(),
-                    );
-                }
-            }
-            Command::Methods {
-                class,
-                name,
-                has_field,
-                ..
-            } => {
-                let field_classes = has_field.as_deref().map(|name| {
-                    index
-                        .fields
-                        .iter()
-                        .filter(|field| field_name_matches(field, name, mapping.as_ref()))
-                        .map(|field| field.class.as_str())
-                        .collect::<HashSet<_>>()
-                });
-
-                for method in &index.locations {
-                    if class
-                        .as_deref()
-                        .is_some_and(|class| !class_matches(&method.class, class, mapping.as_ref()))
-                        || name.as_deref().is_some_and(|name| {
-                            !method_name_matches(method, name, mapping.as_ref())
-                        })
-                        || field_classes
-                            .as_ref()
-                            .is_some_and(|classes| !classes.contains(method.class.as_str()))
-                    {
-                        continue;
-                    }
-
-                    let descriptor =
-                        format!("{}->{}{}", method.class, method.method, method.descriptor);
-                    let originals = mapping
-                        .as_ref()
-                        .map(|mapping| {
-                            mapping
-                                .methods(&method.class, &method.method, &method.descriptor)
-                                .iter()
-                                .filter_map(|alias| {
-                                    mapping.original_class(&method.class).map(|owner| {
-                                        format!("{owner}->{}{}", alias.name, alias.descriptor)
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-
-                    push_aliases(
-                        &mut output,
-                        &apk_name,
-                        &method.dex,
-                        'M',
-                        descriptor,
-                        originals,
-                        method.source_file.as_deref(),
-                    );
-                }
-            }
-            Command::Resources { .. } => unreachable!(),
+                mapping: mapping.as_ref(),
+            })
         }
+        _ => None,
+    };
+    let index = dex::index_apk(&apk, filter.as_ref())?;
+    let apk_name = apk.to_string_lossy();
+
+    match &cli.command {
+        Command::Classes {
+            name,
+            name_prefix,
+            inherits,
+            ..
+        } => {
+            let descendants = inherits
+                .as_deref()
+                .map(|parent| inheritors(&index, parent, mapping.as_ref()));
+
+            for class in &index.classes {
+                if name
+                    .as_deref()
+                    .is_some_and(|name| !class_matches(&class.class, name, mapping.as_ref()))
+                    || name_prefix.as_deref().is_some_and(|prefix| {
+                        !class.class.starts_with(prefix)
+                            && !mapping
+                                .as_ref()
+                                .and_then(|mapping| mapping.original_class(&class.class))
+                                .is_some_and(|name| name.starts_with(prefix))
+                    })
+                    || descendants
+                        .as_ref()
+                        .is_some_and(|descendants| !descendants.contains(class.class.as_str()))
+                {
+                    continue;
+                }
+
+                output.push(Row {
+                    apk: apk_name.to_string(),
+                    dex: class.dex.clone(),
+                    kind: 'C',
+                    descriptor: class.class.clone(),
+                    original: mapping
+                        .as_ref()
+                        .and_then(|mapping| mapping.original_class(&class.class))
+                        .map(str::to_owned),
+                    source: class.source_file.clone(),
+                });
+            }
+        }
+        Command::Fields { class, name, .. } => {
+            for field in &index.fields {
+                if class
+                    .as_deref()
+                    .is_some_and(|class| !class_matches(&field.class, class, mapping.as_ref()))
+                    || name
+                        .as_deref()
+                        .is_some_and(|name| !field_name_matches(field, name, mapping.as_ref()))
+                {
+                    continue;
+                }
+
+                let descriptor = format!("{}->{}:{}", field.class, field.field, field.descriptor);
+                let originals = mapping
+                    .as_ref()
+                    .map(|mapping| {
+                        mapping
+                            .fields(&field.class, &field.field, &field.descriptor)
+                            .iter()
+                            .filter_map(|alias| {
+                                mapping.original_class(&field.class).map(|owner| {
+                                    format!("{owner}->{}:{}", alias.name, alias.descriptor)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                push_aliases(
+                    &mut output,
+                    &apk_name,
+                    &field.dex,
+                    'F',
+                    descriptor,
+                    originals,
+                    field.source_file.as_deref(),
+                );
+            }
+        }
+        Command::Methods {
+            class,
+            name,
+            has_field,
+            ..
+        } => {
+            let field_classes = has_field.as_deref().map(|name| {
+                index
+                    .fields
+                    .iter()
+                    .filter(|field| field_name_matches(field, name, mapping.as_ref()))
+                    .map(|field| field.class.as_str())
+                    .collect::<HashSet<_>>()
+            });
+
+            for method in &index.locations {
+                if class
+                    .as_deref()
+                    .is_some_and(|class| !class_matches(&method.class, class, mapping.as_ref()))
+                    || name
+                        .as_deref()
+                        .is_some_and(|name| !method_name_matches(method, name, mapping.as_ref()))
+                    || field_classes
+                        .as_ref()
+                        .is_some_and(|classes| !classes.contains(method.class.as_str()))
+                {
+                    continue;
+                }
+
+                let descriptor =
+                    format!("{}->{}{}", method.class, method.method, method.descriptor);
+                let originals = mapping
+                    .as_ref()
+                    .map(|mapping| {
+                        mapping
+                            .methods(&method.class, &method.method, &method.descriptor)
+                            .iter()
+                            .filter_map(|alias| {
+                                mapping.original_class(&method.class).map(|owner| {
+                                    format!("{owner}->{}{}", alias.name, alias.descriptor)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                push_aliases(
+                    &mut output,
+                    &apk_name,
+                    &method.dex,
+                    'M',
+                    descriptor,
+                    originals,
+                    method.source_file.as_deref(),
+                );
+            }
+        }
+        Command::Resources { .. } => unreachable!(),
     }
 
     output.sort();
@@ -466,14 +462,12 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn run_resources(input: &Path, query: Query<'_>, options: &ResourceOutput) -> Result<(), String> {
-    let apks = collect_apks(input)?;
+    let apk = validate_apk(input)?;
     let started = Instant::now();
     let mut rows = Vec::new();
 
-    for apk in &apks {
-        for location in resource::index_apk(apk, &query)? {
-            rows.push((apk.to_string_lossy().into_owned(), location));
-        }
+    for location in resource::index_apk(&apk, &query)? {
+        rows.push((apk.to_string_lossy().into_owned(), location));
     }
 
     rows.sort();
@@ -564,53 +558,16 @@ fn non_empty(value: &str) -> Result<String, String> {
     }
 }
 
-fn collect_apks(input: &Path) -> Result<Vec<PathBuf>, String> {
-    if input.is_file() {
-        if !input
+fn validate_apk(input: &Path) -> Result<PathBuf, String> {
+    if !input.is_file()
+        || !input
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
-        {
-            return Err(format!("input is not an APK: {}", input.display()));
-        }
-        return Ok(vec![input.to_owned()]);
+    {
+        return Err(format!("input is not an APK file: {}", input.display()));
     }
 
-    if !input.is_dir() {
-        return Err(format!("input does not exist: {}", input.display()));
-    }
-
-    let mut directories = vec![input.to_owned()];
-    let mut apks = Vec::new();
-
-    while let Some(directory) = directories.pop() {
-        for entry in
-            fs::read_dir(&directory).map_err(|error| format!("{}: {error}", directory.display()))?
-        {
-            let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
-
-            if file_type.is_dir() {
-                directories.push(entry.path());
-            } else if file_type.is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
-            {
-                apks.push(entry.path());
-            }
-        }
-    }
-
-    apks.sort();
-
-    if apks.is_empty() {
-        Err(format!("no APK files found in {}", input.display()))
-    } else {
-        Ok(apks)
-    }
+    Ok(input.to_owned())
 }
 
 #[cfg(test)]

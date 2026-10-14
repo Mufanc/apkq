@@ -1,6 +1,6 @@
 # dexq
 
-`dexq` searches Android APKs directly. It reads DEX metadata, scans method bytecode, and queries compiled Android resources. It does not create a database or cache file, and it does not invoke a decompiler.
+`dexq` searches Android APKs directly. It reads DEX metadata, scans method bytecode, and queries compiled Android resources.
 
 ## Build
 
@@ -31,7 +31,7 @@ dexq r app.apk --type layout --uses-resource string/login_failed
 dexq r app.apk --type layout --uses-resource 0x7f0a0012 --json
 ```
 
-`c`, `f`, `m`, and `r` are aliases for `classes`, `fields`, `methods`, and `resources`. A file input must be an APK; a directory input recursively searches its APKs. Embedded APKs are followed recursively, including their separate resource tables.
+`c`, `f`, `m`, and `r` are aliases for `classes`, `fields`, `methods`, and `resources`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
 
 `resources` reads `resources.arsc`. `--type` limits the resource type in the result (`string`, `id`, `layout`, etc.); `--name` is exact, while `--name-contains` and `--value` are case-sensitive substrings. `--value-regex` searches decoded values with Rust regex syntax. `--id` accepts decimal or `0x` hexadecimal. Filters are combined with AND. `--uses-resource` accepts an ID, `type/name`, or `package:type/name` and finds direct references in table values and compiled XML attributes. XML hits include the node path, attribute, view ID when present, and source line. IDs and symbolic names are resolved separately in each nested APK.
 
@@ -43,18 +43,17 @@ The default output is TSV. Code queries include APK, DEX entry, kind, descriptor
 dexq m app.apk --mapping 'mappings.zip!release/mapping.txt' --name originalMethod --json
 ```
 
-## Limits
+## Search semantics
 
-- Each CLI invocation reads the APK again; there is no persistent cache or database.
-- Bare DEX, JAR, and AAR inputs are not supported.
-- Strings generated at runtime or stored only in resources or native libraries are outside code reference search; use `resources` for compiled resources.
-- Method calls are explicit DEX invokes, not reflection, JNI, or resolved runtime targets of virtual dispatch.
-- `--uses-resource` searches direct references in compiled resources; it does not find DEX code references, dynamically built resource IDs, or transitive references.
-- Regex is available for resource values only. SQL and decompilation are outside dexq. Use ASC or another decompiler to inspect matched classes.
+- Code string queries inspect DEX constants and initialized static string fields. Use `resources` to query compiled resource strings.
+- Method call queries match explicit DEX invoke instructions.
+- Resource reference queries match direct references in resource table values and compiled XML attributes.
+- Resource value queries support Rust regular expressions.
+- Use ASC or another decompiler to inspect matched classes and methods.
 
 ## Code layout
 
 - `src/cli.rs` handles commands and query dispatch; `src/cli/output.rs` formats results.
 - `src/dex.rs` reads APK archives; `src/dex/parse.rs` reads DEX structures, `filter.rs` resolves query targets, and `code.rs` scans instructions.
-- `src/query.rs` parses JavaDoc-style query values; `src/mapping.rs` reads R8/ProGuard mappings.
+- `src/query.rs` parses JavaDoc-style query values; `src/dex/mapping.rs` reads R8/ProGuard mappings.
 - `src/resource.rs` queries resource tables and compiled XML.

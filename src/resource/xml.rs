@@ -147,7 +147,7 @@ pub(super) fn references(bytes: &[u8], targets: &HashSet<u32>) -> Result<Vec<Hit
         }
         cursor = item.end;
     }
-    
+
     if depth != 0 {
         return Err("binary XML has unclosed elements".to_owned());
     }

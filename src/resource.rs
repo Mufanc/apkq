@@ -165,7 +165,7 @@ fn index_archive(
                 if targets.is_empty() {
                     continue;
                 }
-                
+
                 for (attribute, reference) in &resource.references {
                     if targets.contains(reference) {
                         output.push(location(Some(attribute.clone())));
