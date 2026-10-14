@@ -3,7 +3,6 @@ use serde_json::json;
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct Row {
-    pub(super) apk: String,
     pub(super) dex: String,
     pub(super) kind: char,
     pub(super) symbol: String,
@@ -22,7 +21,7 @@ pub(super) fn print_output(
             .iter()
             .map(|row| {
                 json!({
-                    "apk": row.apk, "dex": row.dex, "type": row.kind.to_string(),
+                    "dex": row.dex, "type": row.kind.to_string(),
                     "symbol": row.symbol, "original": row.original, "source": row.source,
                 })
             })
@@ -36,19 +35,14 @@ pub(super) fn print_output(
         print_aligned(output, show_original);
     } else {
         let heading = if show_original {
-            "APK\tDEX\tTYPE\tSYMBOL\tORIGINAL\tSOURCE"
+            "DEX\tTYPE\tSYMBOL\tORIGINAL\tSOURCE"
         } else {
-            "APK\tDEX\tTYPE\tSYMBOL\tSOURCE"
+            "DEX\tTYPE\tSYMBOL\tSOURCE"
         };
         println!("{heading}");
 
         for row in output {
-            let mut fields = vec![
-                tsv(&row.apk),
-                tsv(&row.dex),
-                row.kind.to_string(),
-                tsv(&row.symbol),
-            ];
+            let mut fields = vec![tsv(&row.dex), row.kind.to_string(), tsv(&row.symbol)];
             if show_original {
                 fields.push(tsv(row.original.as_deref().unwrap_or("-")));
             }
@@ -61,12 +55,6 @@ pub(super) fn print_output(
 }
 
 fn print_aligned(output: &[Row], show_original: bool) {
-    let apk_width = output
-        .iter()
-        .map(|row| row.apk.chars().count())
-        .max()
-        .unwrap_or(3)
-        .max(3);
     let dex_width = output
         .iter()
         .map(|row| row.dex.chars().count())
@@ -82,8 +70,8 @@ fn print_aligned(output: &[Row], show_original: bool) {
 
     let original_heading = if show_original { "  ORIGINAL" } else { "" };
     println!(
-        "{:<apk_width$}  {:<dex_width$}  TYPE  {:<symbol_width$}{original_heading}  SOURCE",
-        "APK", "DEX", "SYMBOL"
+        "{:<dex_width$}  TYPE  {:<symbol_width$}{original_heading}  SOURCE",
+        "DEX", "SYMBOL"
     );
 
     for row in output {
@@ -93,8 +81,7 @@ fn print_aligned(output: &[Row], show_original: bool) {
             String::new()
         };
         println!(
-            "{:<apk_width$}  {:<dex_width$}  {:<4}  {:<symbol_width$}{}  {}",
-            row.apk,
+            "{:<dex_width$}  {:<4}  {:<symbol_width$}{}  {}",
             row.dex,
             row.kind,
             row.symbol,
@@ -106,7 +93,6 @@ fn print_aligned(output: &[Row], show_original: bool) {
 
 pub(super) fn push_aliases(
     output: &mut Vec<Row>,
-    apk: &str,
     dex: &str,
     kind: char,
     symbol: String,
@@ -115,7 +101,6 @@ pub(super) fn push_aliases(
 ) {
     if originals.is_empty() {
         output.push(Row {
-            apk: apk.to_owned(),
             dex: dex.to_owned(),
             kind,
             symbol,
@@ -125,7 +110,6 @@ pub(super) fn push_aliases(
     } else {
         for original in originals {
             output.push(Row {
-                apk: apk.to_owned(),
                 dex: dex.to_owned(),
                 kind,
                 symbol: symbol.clone(),
@@ -145,16 +129,16 @@ fn tsv(value: &str) -> String {
 }
 
 pub(super) fn print_resources(
-    rows: &[(&str, &Location)],
+    rows: &[Location],
     json_output: bool,
     aligned: bool,
 ) -> Result<(), String> {
     if json_output {
         let values = rows
             .iter()
-            .map(|(apk, row)| {
+            .map(|row| {
                 json!({
-                    "apk": apk, "archive": row.archive, "id": format!("0x{:08x}", row.id),
+                    "archive": row.archive, "id": format!("0x{:08x}", row.id),
                     "type": row.kind, "name": row.name,
                     "config": row.config, "value": row.value, "path": row.path,
                     "usage": row.usage,
@@ -168,13 +152,12 @@ pub(super) fn print_resources(
         return Ok(());
     }
     let headings = [
-        "APK", "ARCHIVE", "ID", "TYPE", "NAME", "CONFIG", "VALUE", "PATH", "USAGE",
+        "ARCHIVE", "ID", "TYPE", "NAME", "CONFIG", "VALUE", "PATH", "USAGE",
     ];
     let fields = rows
         .iter()
-        .map(|(apk, row)| {
+        .map(|row| {
             vec![
-                (*apk).to_owned(),
                 row.archive.clone(),
                 format!("0x{:08x}", row.id),
                 row.kind.clone(),

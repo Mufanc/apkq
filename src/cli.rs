@@ -29,7 +29,7 @@ use output::{Row, print_output, print_resources, push_aliases};
   apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
-Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain APK, nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
+Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
 Mapping: --mapping accepts a file or 'archive.zip!entry'. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings.
 Search covers DEX definitions and references, compiled resource values, and XML attributes.
 Run 'apkq <apk> <command> --help' for query syntax."#
@@ -264,7 +264,6 @@ fn run(cli: Cli) -> Result<(), String> {
         _ => None,
     };
     let index = dex::index_apk(&apk, filter.as_ref())?;
-    let apk_name = apk.to_string_lossy();
 
     match &cli.command {
         Command::Classes {
@@ -293,7 +292,6 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
 
                 output.push(Row {
-                    apk: apk_name.to_string(),
                     dex: class.dex.clone(),
                     kind: 'C',
                     symbol: JavaClass::from_descriptor(&class.class)?.to_string(),
@@ -345,7 +343,6 @@ fn run(cli: Cli) -> Result<(), String> {
 
                 push_aliases(
                     &mut output,
-                    &apk_name,
                     &field.dex,
                     'F',
                     symbol,
@@ -409,7 +406,6 @@ fn run(cli: Cli) -> Result<(), String> {
 
                 push_aliases(
                     &mut output,
-                    &apk_name,
                     &method.dex,
                     'M',
                     symbol,
@@ -438,22 +434,11 @@ fn run(cli: Cli) -> Result<(), String> {
 fn run_resources(input: &Path, query: Query<'_>, json: bool, aligned: bool) -> Result<(), String> {
     let apk = validate_apk(input)?;
     let started = Instant::now();
-    let mut rows = Vec::new();
-
-    for location in resource::index_apk(&apk, &query)? {
-        rows.push((apk.to_string_lossy().into_owned(), location));
-    }
+    let mut rows = resource::index_apk(&apk, &query)?;
 
     rows.sort();
     rows.dedup();
-    print_resources(
-        &rows
-            .iter()
-            .map(|(apk, row)| (apk.as_str(), row))
-            .collect::<Vec<_>>(),
-        json,
-        aligned,
-    )?;
+    print_resources(&rows, json, aligned)?;
 
     eprintln!(
         "searched in {:.3}s; {} match(es)",
