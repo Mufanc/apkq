@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod binary;
+mod input;
+
 pub mod dex;
-pub mod mapping;
 pub mod query;
+pub mod resource;

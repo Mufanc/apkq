@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::fs;
+#[cfg(test)]
 use std::io::{Cursor, Read};
 
+use crate::input;
+#[cfg(test)]
 use zip::ZipArchive;
 
 #[derive(Debug)]
@@ -109,20 +111,7 @@ impl Mapping {
 }
 
 pub fn load(spec: &str) -> Result<Mapping, String> {
-    let bytes = if let Some((archive, entry)) = spec.split_once('!') {
-        if entry.is_empty() {
-            return Err("mapping ZIP entry cannot be empty".to_owned());
-        }
-
-        if entry.contains('!') {
-            return Err("nested mapping archives are not supported".to_owned());
-        }
-
-        let bytes = fs::read(archive).map_err(|error| format!("{archive}: {error}"))?;
-        read_zip_entry(&bytes, archive, entry)?
-    } else {
-        fs::read(spec).map_err(|error| format!("{spec}: {error}"))?
-    };
+    let bytes = input::read_file_spec(spec)?;
 
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| format!("mapping is not valid UTF-8: {error}"))?;
@@ -130,6 +119,7 @@ pub fn load(spec: &str) -> Result<Mapping, String> {
     Mapping::parse(text)
 }
 
+#[cfg(test)]
 fn read_zip_entry(bytes: &[u8], archive: &str, entry: &str) -> Result<Vec<u8>, String> {
     let mut zip = ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| format!("invalid mapping ZIP {archive}: {error}"))?;
@@ -138,6 +128,7 @@ fn read_zip_entry(bytes: &[u8], archive: &str, entry: &str) -> Result<Vec<u8>, S
         .map_err(|error| format!("{archive}!{entry}: {error}"))?;
 
     let mut output = Vec::new();
+
     file.read_to_end(&mut output)
         .map_err(|error| format!("{archive}!{entry}: {error}"))?;
 

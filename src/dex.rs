@@ -5,20 +5,20 @@ use std::path::Path;
 
 use zip::{CompressionMethod, ZipArchive};
 
-use crate::mapping::Mapping;
-
 mod code;
 mod filter;
 mod format;
+pub mod mapping;
 mod opcode;
 mod parse;
 use crate::query::{CallQuery, FieldQuery};
+use mapping::Mapping;
 
 #[derive(Debug)]
 pub struct PreparedArchive {
-    bytes: Vec<u8>,
-    label: String,
-    nested: Vec<PreparedArchive>,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) label: String,
+    pub(crate) nested: Vec<PreparedArchive>,
 }
 
 #[derive(Debug)]

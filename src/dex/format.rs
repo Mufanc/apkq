@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use crate::binary::{ByteView, Cursor};
+
 const HEADER_SIZE: usize = 0x70;
 const HEADER_FIELDS_OFFSET: usize = 0x20;
 const LINK_AND_MAP_FIELDS_SIZE: usize = 12;
@@ -81,7 +83,7 @@ impl<'a> Dex<'a> {
 
 impl Header {
     fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let view = ByteView(bytes);
+        let view = ByteView::new(bytes);
         let magic = view.slice(0, 8)?;
 
         if &magic[..4] != b"dex\n" || !magic[4..7].iter().all(u8::is_ascii_digit) || magic[7] != 0 {
@@ -129,38 +131,10 @@ struct DexView<'a> {
 
 impl<'a> DexView<'a> {
     fn bytes(self) -> ByteView<'a> {
-        ByteView(self.bytes)
+        ByteView::new(self.bytes)
     }
 }
-
-#[derive(Clone, Copy)]
-pub(super) struct ByteView<'a>(&'a [u8]);
-
-impl<'a> ByteView<'a> {
-    pub(super) fn new(bytes: &'a [u8]) -> Self {
-        Self(bytes)
-    }
-
-    pub(super) fn slice(self, offset: usize, length: usize) -> Result<&'a [u8], String> {
-        let end = offset
-            .checked_add(length)
-            .ok_or("DEX byte range overflow")?;
-
-        self.0
-            .get(offset..end)
-            .ok_or_else(|| "read beyond DEX boundary".to_owned())
-    }
-
-    pub(super) fn u16(self, offset: usize) -> Result<u16, String> {
-        let bytes = self.slice(offset, 2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    pub(super) fn u32(self, offset: usize) -> Result<u32, String> {
-        let bytes = self.slice(offset, 4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
+impl ByteView<'_> {
     fn section(self, cursor: &mut Cursor<'_>, width: usize) -> Result<Section, String> {
         let section = Section {
             count: cursor.read_u32()? as usize,
@@ -637,53 +611,13 @@ pub(super) enum EncodedValue {
     Other,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct Cursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
+trait DexCursor {
+    fn read_uleb128(&mut self) -> Result<u32, String>;
+    fn read_little_endian(&mut self, byte_count: usize) -> Result<u64, String>;
 }
 
-impl<'a> Cursor<'a> {
-    pub(super) fn new(bytes: &'a [u8], offset: usize) -> Result<Self, String> {
-        if offset > bytes.len() {
-            return Err("cursor starts beyond DEX boundary".to_owned());
-        }
-
-        Ok(Self { bytes, offset })
-    }
-
-    fn offset(&self) -> usize {
-        self.offset
-    }
-
-    fn read_u8(&mut self) -> Result<u8, String> {
-        let value = *self
-            .bytes
-            .get(self.offset)
-            .ok_or("read beyond DEX boundary")?;
-        self.offset += 1;
-        Ok(value)
-    }
-
-    fn read_u16(&mut self) -> Result<u16, String> {
-        let value = ByteView(self.bytes).u16(self.offset)?;
-        self.offset += 2;
-        Ok(value)
-    }
-
-    fn read_u32(&mut self) -> Result<u32, String> {
-        let value = ByteView(self.bytes).u32(self.offset)?;
-        self.offset += 4;
-        Ok(value)
-    }
-
-    fn skip(&mut self, length: usize) -> Result<(), String> {
-        ByteView(self.bytes).slice(self.offset, length)?;
-        self.offset += length;
-        Ok(())
-    }
-
-    pub(super) fn read_uleb128(&mut self) -> Result<u32, String> {
+impl DexCursor for Cursor<'_> {
+    fn read_uleb128(&mut self) -> Result<u32, String> {
         let mut value = 0u32;
 
         for shift in (0..35).step_by(7) {
@@ -703,8 +637,8 @@ impl<'a> Cursor<'a> {
             return Err("encoded_value is too wide".to_owned());
         }
 
-        let bytes = ByteView(self.bytes).slice(self.offset, byte_count)?;
-        self.offset += byte_count;
+        let bytes = self.read_bytes(byte_count)?;
+
         Ok(bytes.iter().enumerate().fold(0, |value, (shift, byte)| {
             value | (*byte as u64) << (shift * 8)
         }))

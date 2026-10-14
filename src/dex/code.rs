@@ -1,5 +1,5 @@
-use super::format::ByteView;
 use super::opcode::{InstructionDescriptor, Opcode, ReferenceKind};
+use crate::binary::ByteView;
 
 const CODE_ITEM_HEADER_SIZE: usize = 16;
 const INSTRUCTION_COUNT_OFFSET: usize = 12;

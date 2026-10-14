@@ -7,13 +7,15 @@ use std::process;
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
+use dexq::dex::mapping::{self, Mapping};
 use dexq::dex::{self, DexIndex, ReferenceFilter};
-use dexq::mapping::{self, Mapping};
 use dexq::query::{self, CallQuery, FieldQuery};
+use dexq::resource::{self, Query};
+use regex::Regex;
 
 mod output;
 
-use output::{Row, print_output, push_aliases};
+use output::{Row, print_output, print_resources, push_aliases};
 
 #[derive(Parser)]
 #[command(
@@ -23,12 +25,14 @@ use output::{Row, print_output, push_aliases};
   dexq c app.apk --name com.example.MainActivity
   dexq f app.apk --class com.example.Config --name apiKey
   dexq m app.apk --uses-string token
+  dexq r app.apk --type string --value 'Login failed'
+  dexq r app.apk --type layout --uses-resource string/login_failed
   dexq m ./apks --mapping 'mapping.zip!path/to/mapping.txt' --json
 
 Input: an APK or a directory searched recursively for APKs; nested APKs are searched too. Standalone DEX, JAR and AAR files are unsupported.
-Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Columns: APK path, DEX entry, TYPE (C/F/M), DEX DESCRIPTOR, ORIGINAL mapped name, SOURCE file.
+Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), DESCRIPTOR, ORIGINAL, SOURCE. Resource rows include APK, nested ARCHIVE, ID, PACKAGE, TYPE, NAME, CONFIG, VALUE, PATH and reference location.
 Mapping: --mapping mapping.txt or --mapping 'mapping.zip!path/to/mapping.txt'. Mapped class/member names can be used in queries and appear in output.
-Scope: DEX definitions and explicit code references; no decompilation, reflection or runtime-generated strings.
+Scope: DEX definitions, explicit code references, compiled resource values and XML attributes; no decompilation, reflection or runtime-generated strings.
 Run 'dexq <command> --help' for query syntax."#
 )]
 struct Cli {
@@ -49,8 +53,64 @@ struct Common {
     aligned: bool,
 }
 
+#[derive(Args)]
+struct ResourceOutput {
+    /// AndResGuard resource mapping file, or ZIP entry
+    #[arg(long, value_name = "FILE[!ENTRY]")]
+    mapping: Option<String>,
+    /// Emit a JSON array instead of TSV
+    #[arg(long)]
+    json: bool,
+    /// Align text columns instead of TSV
+    #[arg(long, conflicts_with = "json")]
+    aligned: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Find Android resources and references in compiled XML
+    #[command(
+        visible_alias = "r",
+        after_help = r#"Resources are read from resources.arsc in each APK, including embedded APKs. IDs are scoped to their containing APK.
+--type limits returned resource types, for example string, id, or layout. --name is exact; --name-contains and --value are case-sensitive substrings. --value-regex uses Rust regex syntax. Filters are ANDed.
+--uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. XML results include node, attribute, view ID and source line. It does not scan DEX code or resolve runtime references.
+
+Examples:
+  dexq r app.apk --type string --value 'Login failed'
+  dexq r app.apk --type string --value-regex 'login|sign.?in'
+  dexq r app.apk --type id --name-contains button
+  dexq r app.apk --type layout --name activity_login
+  dexq r app.apk --id 0x7f0a0012
+  dexq r app.apk --type layout --uses-resource string/login_failed
+  dexq r app.apk --type layout --uses-resource 0x7f0a0012 --json"#
+    )]
+    Resources {
+        /// APK file or directory to search recursively
+        input: PathBuf,
+        /// Exact resource type, such as string, id, or layout
+        #[arg(long = "type", value_parser = non_empty)]
+        kind: Option<String>,
+        /// Exact resource entry name
+        #[arg(long, value_parser = non_empty)]
+        name: Option<String>,
+        /// Case-sensitive resource name substring
+        #[arg(long, value_parser = non_empty)]
+        name_contains: Option<String>,
+        /// Numeric resource ID, decimal or 0x-prefixed hexadecimal
+        #[arg(long, value_parser = resource::parse_id)]
+        id: Option<u32>,
+        /// Case-sensitive substring of decoded resource value
+        #[arg(long, value_parser = non_empty)]
+        value: Option<String>,
+        /// Regex for decoded resource value
+        #[arg(long, value_parser = non_empty)]
+        value_regex: Option<String>,
+        /// Referenced ID, type/name, or package:type/name
+        #[arg(long, value_parser = resource::validate_reference)]
+        uses_resource: Option<String>,
+        #[command(flatten)]
+        output: ResourceOutput,
+    },
     /// Find class definitions
     #[command(
         visible_alias = "c",
@@ -166,10 +226,50 @@ pub(super) fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if let Command::Resources {
+        input,
+        kind,
+        name,
+        name_contains,
+        id,
+        value,
+        value_regex,
+        uses_resource,
+        output,
+    } = &cli.command
+    {
+        let mapping = output
+            .mapping
+            .as_deref()
+            .map(resource::mapping::load)
+            .transpose()?;
+
+        return run_resources(
+            input,
+            Query {
+                mapping: mapping.as_ref(),
+                kind: kind.as_deref(),
+                name: name.as_deref(),
+                name_contains: name_contains.as_deref(),
+                id: *id,
+                value: value.as_deref(),
+                value_regex: value_regex
+                    .as_deref()
+                    .map(Regex::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .as_ref(),
+                uses_resource: uses_resource.as_deref(),
+            },
+            output,
+        );
+    }
+
     let (input, common) = match &cli.command {
         Command::Classes { input, common, .. }
         | Command::Fields { input, common, .. }
         | Command::Methods { input, common, .. } => (input, common),
+        Command::Resources { .. } => unreachable!(),
     };
 
     let apks = collect_apks(input)?;
@@ -342,6 +442,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     );
                 }
             }
+            Command::Resources { .. } => unreachable!(),
         }
     }
 
@@ -356,6 +457,36 @@ fn run(cli: Cli) -> Result<(), String> {
         output.len()
     );
 
+    Ok(())
+}
+
+fn run_resources(input: &Path, query: Query<'_>, options: &ResourceOutput) -> Result<(), String> {
+    let apks = collect_apks(input)?;
+    let started = Instant::now();
+    let mut rows = Vec::new();
+
+    for apk in &apks {
+        for location in resource::index_apk(apk, &query)? {
+            rows.push((apk.to_string_lossy().into_owned(), location));
+        }
+    }
+
+    rows.sort();
+    rows.dedup();
+    print_resources(
+        &rows
+            .iter()
+            .map(|(apk, row)| (apk.as_str(), row))
+            .collect::<Vec<_>>(),
+        options.json,
+        options.aligned,
+    )?;
+
+    eprintln!(
+        "searched in {:.3}s; {} match(es)",
+        started.elapsed().as_secs_f64(),
+        rows.len()
+    );
     Ok(())
 }
 
@@ -517,5 +648,27 @@ mod tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["dexq", "c", "app.apk", "--inherits", "LBase;"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "dexq",
+                "r",
+                "app.apk",
+                "--type",
+                "layout",
+                "--uses-resource",
+                "id/title"
+            ])
+            .unwrap()
+            .command,
+            Command::Resources {
+                kind: Some(_),
+                uses_resource: Some(_),
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["dexq", "r", "app.apk", "--id", "0x7f0a0012"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["dexq", "r", "app.apk", "--uses-resource", "broken"]).is_err()
+        );
     }
 }
