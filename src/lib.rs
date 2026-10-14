@@ -4,5 +4,5 @@ mod binary;
 mod input;
 
 pub mod dex;
-pub mod query;
+pub mod java;
 pub mod resource;

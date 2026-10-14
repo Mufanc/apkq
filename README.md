@@ -13,6 +13,7 @@ cargo build --release
 ```sh
 apkq app.apk classes --name com.example.MainActivity
 apkq app.apk c --name-prefix com.example.
+apkq app.apk c --simple-name MainActivity
 apkq app.apk c --inherits android.app.Activity
 apkq app.apk fields --class com.example.Config --name apiKey
 apkq app.apk f --name apiKey
@@ -35,9 +36,9 @@ apkq app.apk --json r --type layout --uses-resource 0x7f0a0012
 
 `resources` reads `resources.arsc`. `--type` limits the resource type in the result (`string`, `id`, `layout`, etc.); `--name` is exact, while `--name-contains` and `--value` are case-sensitive substrings. `--value-regex` searches decoded values with Rust regex syntax. `--id` accepts decimal or `0x` hexadecimal. Filters are combined with AND. `--uses-resource` accepts an ID, `type/name`, or `package:type/name` and finds direct references in table values and compiled XML attributes. XML hits include the node path, attribute, view ID when present, and source line. IDs and symbolic names are resolved separately in each nested APK.
 
-All filters in a command are combined with AND. In `methods`, every reference filter must match within the **same method**. Repeat `--uses-string` for multiple string fragments. String matching is case-sensitive substring matching and includes reads of static string fields initialized in DEX. Query types use dotted Java names (`com.example.Client`, `int`, `java.lang.String[]`). Members use `Class#name`; `--calls` may add `(parameterTypes):returnType` for an exact signature, and `--uses-field` may add `:type`. Without a signature or type, all members with that class and name match. `methods --has-field` keeps methods whose declaring class defines the named field. `--name` is an exact class, method, or field name. `classes --inherits` includes direct and transitive subclasses and interface implementors.
+All filters in a command are combined with AND. In `methods`, every reference filter must match within the **same method**. Repeat `--uses-string` for multiple string fragments. String matching is case-sensitive substring matching and includes reads of static string fields initialized in DEX. Query types use dotted Java names (`com.example.Client`, `int`, `java.lang.String[]`). Members use `Class#name`; `--calls` may add `(parameterTypes):returnType` for an exact signature, and `--uses-field` may add `:type`. Without a signature or type, all members with that class and name match. `methods --has-field` keeps methods whose declaring class defines the named field. `--name` is an exact class, method, or field name. `classes --name-prefix` matches a package or class-name prefix, `--simple-name` matches the exact name after the final package separator, and `--inherits` includes direct and transitive subclasses and interface implementors.
 
-The default output is TSV. Code queries include APK, DEX entry, kind, descriptor, optional original mapped name, and source file. Resource queries include APK, nested archive path, ID, type, name, configuration, value, file path, and usage. Use `--aligned` for space-aligned text or `--json` for an array of objects. Timing and match count are printed to stderr. Supply a mapping file, or an entry in a ZIP, to search mapped names. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings:
+The default output is TSV. Code queries include APK, DEX entry, kind, a Java/Javadoc-style symbol that can be reused in queries, an optional original mapped symbol, and source file. Resource queries include APK, nested archive path, ID, type, name, configuration, value, file path, and usage. Use `--aligned` for space-aligned text or `--json` for an array of objects. Timing and match count are printed to stderr. Supply a mapping file, or an entry in a ZIP, to search mapped names. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings:
 
 ```sh
 apkq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name originalMethod
@@ -55,5 +56,5 @@ apkq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name origin
 
 - `src/cli.rs` handles commands and query dispatch; `src/cli/output.rs` formats results.
 - `src/dex.rs` reads APK archives; `src/dex/parse.rs` reads DEX structures, `filter.rs` resolves query targets, and `code.rs` scans instructions.
-- `src/query.rs` parses JavaDoc-style query values; `src/dex/mapping.rs` reads R8/ProGuard mappings.
+- `src/java.rs` parses and formats Java-style symbols; `src/dex/mapping.rs` reads R8/ProGuard mappings.
 - `src/resource.rs` queries resource tables and compiled XML.

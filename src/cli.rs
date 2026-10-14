@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use apkq::dex::mapping::{self, Mapping};
 use apkq::dex::{self, DexIndex, ReferenceFilter};
-use apkq::query::{self, CallQuery, FieldQuery};
+use apkq::java::{JavaClass, JavaField, JavaMethod, JavaType};
 use apkq::resource::{self, Query};
 use clap::{Parser, Subcommand};
 use regex::Regex;
@@ -29,7 +29,7 @@ use output::{Row, print_output, print_resources, push_aliases};
   apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
-Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), DESCRIPTOR, optional ORIGINAL, and SOURCE. Resource rows contain APK, nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
+Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain APK, nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
 Mapping: --mapping accepts a file or 'archive.zip!entry'. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings.
 Search covers DEX definitions and references, compiled resource values, and XML attributes.
 Run 'apkq <apk> <command> --help' for query syntax."#
@@ -102,22 +102,26 @@ Filters are ANDed. With --mapping, class filters also match original names.
 Examples:
   apkq app.apk c --name com.example.MainActivity
   apkq app.apk c --name-prefix com.example.
+  apkq app.apk c --simple-name MainActivity
   apkq app.apk c --inherits android.app.Activity
   apkq app.apk --mapping mapping.txt c --inherits com.example.ItemBase"#
     )]
     Classes {
         /// Exact class name
-        #[arg(long, value_parser = query::parse_class)]
-        name: Option<String>,
+        #[arg(long)]
+        name: Option<JavaClass>,
         #[arg(
             long = "name-prefix",
-            value_parser = query::parse_class_prefix,
+            value_parser = parse_class_prefix,
             help = "Class name prefix, such as com.example."
         )]
         name_prefix: Option<String>,
+        /// Exact class name without its package, such as MainActivity
+        #[arg(long, value_parser = parse_simple_name)]
+        simple_name: Option<String>,
         /// Direct or transitive subclasses and implementors
-        #[arg(long, value_parser = query::parse_class)]
-        inherits: Option<String>,
+        #[arg(long)]
+        inherits: Option<JavaClass>,
     },
     /// Find field definitions
     #[command(
@@ -132,8 +136,8 @@ Examples:
     )]
     Fields {
         /// Exact declaring class name
-        #[arg(long, value_parser = query::parse_class)]
-        class: Option<String>,
+        #[arg(long)]
+        class: Option<JavaClass>,
         /// Exact field name
         #[arg(long)]
         name: Option<String>,
@@ -163,8 +167,8 @@ Examples:
     )]
     Methods {
         /// Exact declaring class name
-        #[arg(long, value_parser = query::parse_class)]
-        class: Option<String>,
+        #[arg(long)]
+        class: Option<JavaClass>,
         /// Exact method name
         #[arg(long)]
         name: Option<String>,
@@ -175,14 +179,14 @@ Examples:
         #[arg(long = "uses-string", alias = "string", value_parser = non_empty)]
         strings: Vec<String>,
         /// Called method: Class#name or Class#name(parameters):returnType
-        #[arg(long = "calls", value_parser = query::parse_call_query)]
-        calls: Vec<CallQuery>,
+        #[arg(long = "calls")]
+        calls: Vec<JavaMethod>,
         /// Referenced type, such as java.lang.String
-        #[arg(long = "uses-type", value_parser = query::parse_type)]
-        types: Vec<String>,
+        #[arg(long = "uses-type")]
+        types: Vec<JavaType>,
         /// Accessed field: Class#name or Class#name:type
-        #[arg(long = "uses-field", value_parser = query::parse_field_query)]
-        fields: Vec<FieldQuery>,
+        #[arg(long = "uses-field")]
+        fields: Vec<JavaField>,
     },
 }
 
@@ -266,27 +270,24 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Classes {
             name,
             name_prefix,
+            simple_name,
             inherits,
             ..
         } => {
             let descendants = inherits
-                .as_deref()
+                .as_ref()
                 .map(|parent| inheritors(&index, parent, mapping.as_ref()));
 
             for class in &index.classes {
-                if name
-                    .as_deref()
-                    .is_some_and(|name| !class_matches(&class.class, name, mapping.as_ref()))
-                    || name_prefix.as_deref().is_some_and(|prefix| {
-                        !class.class.starts_with(prefix)
-                            && !mapping
-                                .as_ref()
-                                .and_then(|mapping| mapping.original_class(&class.class))
-                                .is_some_and(|name| name.starts_with(prefix))
-                    })
-                    || descendants
-                        .as_ref()
-                        .is_some_and(|descendants| !descendants.contains(class.class.as_str()))
+                if !class_filters_match(
+                    &class.class,
+                    name.as_ref(),
+                    name_prefix.as_deref(),
+                    simple_name.as_deref(),
+                    mapping.as_ref(),
+                ) || descendants
+                    .as_ref()
+                    .is_some_and(|descendants| !descendants.contains(class.class.as_str()))
                 {
                     continue;
                 }
@@ -295,11 +296,13 @@ fn run(cli: Cli) -> Result<(), String> {
                     apk: apk_name.to_string(),
                     dex: class.dex.clone(),
                     kind: 'C',
-                    descriptor: class.class.clone(),
+                    symbol: JavaClass::from_descriptor(&class.class)?.to_string(),
                     original: mapping
                         .as_ref()
                         .and_then(|mapping| mapping.original_class(&class.class))
-                        .map(str::to_owned),
+                        .map(JavaClass::from_descriptor)
+                        .transpose()?
+                        .map(|class| class.to_string()),
                     source: class.source_file.clone(),
                 });
             }
@@ -307,7 +310,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Fields { class, name, .. } => {
             for field in &index.fields {
                 if class
-                    .as_deref()
+                    .as_ref()
                     .is_some_and(|class| !class_matches(&field.class, class, mapping.as_ref()))
                     || name
                         .as_deref()
@@ -316,7 +319,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     continue;
                 }
 
-                let descriptor = format!("{}->{}:{}", field.class, field.field, field.descriptor);
+                let symbol =
+                    JavaField::from_descriptor(&field.class, &field.field, &field.descriptor)?
+                        .to_string();
                 let originals = mapping
                     .as_ref()
                     .map(|mapping| {
@@ -325,11 +330,17 @@ fn run(cli: Cli) -> Result<(), String> {
                             .iter()
                             .filter_map(|alias| {
                                 mapping.original_class(&field.class).map(|owner| {
-                                    format!("{owner}->{}:{}", alias.name, alias.descriptor)
+                                    JavaField::from_descriptor(
+                                        owner,
+                                        &alias.name,
+                                        &alias.descriptor,
+                                    )
+                                    .map(|field| field.to_string())
                                 })
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>, _>>()
                     })
+                    .transpose()?
                     .unwrap_or_default();
 
                 push_aliases(
@@ -337,7 +348,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     &apk_name,
                     &field.dex,
                     'F',
-                    descriptor,
+                    symbol,
                     originals,
                     field.source_file.as_deref(),
                 );
@@ -360,7 +371,7 @@ fn run(cli: Cli) -> Result<(), String> {
 
             for method in &index.locations {
                 if class
-                    .as_deref()
+                    .as_ref()
                     .is_some_and(|class| !class_matches(&method.class, class, mapping.as_ref()))
                     || name
                         .as_deref()
@@ -372,8 +383,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     continue;
                 }
 
-                let descriptor =
-                    format!("{}->{}{}", method.class, method.method, method.descriptor);
+                let symbol =
+                    JavaMethod::from_descriptor(&method.class, &method.method, &method.descriptor)?
+                        .to_string();
                 let originals = mapping
                     .as_ref()
                     .map(|mapping| {
@@ -382,11 +394,17 @@ fn run(cli: Cli) -> Result<(), String> {
                             .iter()
                             .filter_map(|alias| {
                                 mapping.original_class(&method.class).map(|owner| {
-                                    format!("{owner}->{}{}", alias.name, alias.descriptor)
+                                    JavaMethod::from_descriptor(
+                                        owner,
+                                        &alias.name,
+                                        &alias.descriptor,
+                                    )
+                                    .map(|method| method.to_string())
                                 })
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>, _>>()
                     })
+                    .transpose()?
                     .unwrap_or_default();
 
                 push_aliases(
@@ -394,7 +412,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     &apk_name,
                     &method.dex,
                     'M',
-                    descriptor,
+                    symbol,
                     originals,
                     method.source_file.as_deref(),
                 );
@@ -445,11 +463,37 @@ fn run_resources(input: &Path, query: Query<'_>, json: bool, aligned: bool) -> R
     Ok(())
 }
 
-fn class_matches(descriptor: &str, query: &str, mapping: Option<&Mapping>) -> bool {
-    descriptor == query
+fn class_matches(descriptor: &str, query: &JavaClass, mapping: Option<&Mapping>) -> bool {
+    descriptor == query.descriptor()
         || mapping
             .and_then(|mapping| mapping.original_class(descriptor))
-            .is_some_and(|name| name == query)
+            .is_some_and(|name| name == query.descriptor())
+}
+
+fn class_filters_match(
+    descriptor: &str,
+    name: Option<&JavaClass>,
+    name_prefix: Option<&str>,
+    simple_name: Option<&str>,
+    mapping: Option<&Mapping>,
+) -> bool {
+    let original = mapping.and_then(|mapping| mapping.original_class(descriptor));
+    let names = [Some(descriptor), original];
+
+    name.is_none_or(|query| {
+        names
+            .iter()
+            .flatten()
+            .any(|name| *name == query.descriptor())
+    }) && name_prefix
+        .is_none_or(|prefix| names.iter().flatten().any(|name| name.starts_with(prefix)))
+        && simple_name.is_none_or(|simple| {
+            names
+                .iter()
+                .flatten()
+                .filter_map(|name| descriptor_simple_name(name))
+                .any(|name| name == simple)
+        })
 }
 
 fn method_name_matches(
@@ -476,7 +520,11 @@ fn field_name_matches(field: &dex::FieldLocation, query: &str, mapping: Option<&
         })
 }
 
-fn inheritors<'a>(index: &'a DexIndex, query: &str, mapping: Option<&Mapping>) -> HashSet<&'a str> {
+fn inheritors<'a>(
+    index: &'a DexIndex,
+    query: &JavaClass,
+    mapping: Option<&Mapping>,
+) -> HashSet<&'a str> {
     let mut children = HashMap::<&str, Vec<&str>>::new();
 
     for class in &index.classes {
@@ -514,6 +562,42 @@ fn non_empty(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_class_prefix(value: &str) -> Result<String, String> {
+    let stem = value.strip_suffix('.').unwrap_or(value);
+    if !valid_dotted_name(stem) {
+        return Err(format!("invalid dotted class prefix: {value}"));
+    }
+
+    Ok(format!("L{}", value.replace('.', "/")))
+}
+
+fn parse_simple_name(value: &str) -> Result<String, String> {
+    if value.contains('.') || !valid_name_part(value) {
+        return Err(format!("invalid simple class name: {value}"));
+    }
+
+    Ok(value.to_owned())
+}
+
+fn descriptor_simple_name(descriptor: &str) -> Option<&str> {
+    descriptor
+        .strip_prefix('L')?
+        .strip_suffix(';')?
+        .rsplit('/')
+        .next()
+}
+
+fn valid_dotted_name(value: &str) -> bool {
+    value.split('.').all(valid_name_part)
+}
+
+fn valid_name_part(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
+}
+
 fn validate_apk(input: &Path) -> Result<PathBuf, String> {
     if !input.is_file()
         || !input
@@ -545,6 +629,13 @@ mod tests {
                 .command,
             Command::Classes { .. }
         ));
+        assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "c", "--simple-name", "MainActivity"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "c", "--simple-name", "com.example.Main"])
+                .is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from(["apkq", "app.apk", "f", "--name", "apiKey"])
                 .unwrap()

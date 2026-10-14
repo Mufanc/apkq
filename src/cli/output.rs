@@ -6,7 +6,7 @@ pub(super) struct Row {
     pub(super) apk: String,
     pub(super) dex: String,
     pub(super) kind: char,
-    pub(super) descriptor: String,
+    pub(super) symbol: String,
     pub(super) original: Option<String>,
     pub(super) source: Option<String>,
 }
@@ -23,7 +23,7 @@ pub(super) fn print_output(
             .map(|row| {
                 json!({
                     "apk": row.apk, "dex": row.dex, "type": row.kind.to_string(),
-                    "descriptor": row.descriptor, "original": row.original, "source": row.source,
+                    "symbol": row.symbol, "original": row.original, "source": row.source,
                 })
             })
             .collect::<Vec<_>>();
@@ -36,9 +36,9 @@ pub(super) fn print_output(
         print_aligned(output, show_original);
     } else {
         let heading = if show_original {
-            "APK\tDEX\tTYPE\tDESCRIPTOR\tORIGINAL\tSOURCE"
+            "APK\tDEX\tTYPE\tSYMBOL\tORIGINAL\tSOURCE"
         } else {
-            "APK\tDEX\tTYPE\tDESCRIPTOR\tSOURCE"
+            "APK\tDEX\tTYPE\tSYMBOL\tSOURCE"
         };
         println!("{heading}");
 
@@ -47,7 +47,7 @@ pub(super) fn print_output(
                 tsv(&row.apk),
                 tsv(&row.dex),
                 row.kind.to_string(),
-                tsv(&row.descriptor),
+                tsv(&row.symbol),
             ];
             if show_original {
                 fields.push(tsv(row.original.as_deref().unwrap_or("-")));
@@ -73,17 +73,17 @@ fn print_aligned(output: &[Row], show_original: bool) {
         .max()
         .unwrap_or(3)
         .max(3);
-    let descriptor_width = output
+    let symbol_width = output
         .iter()
-        .map(|row| row.descriptor.chars().count())
+        .map(|row| row.symbol.chars().count())
         .max()
-        .unwrap_or(10)
-        .max(10);
+        .unwrap_or(6)
+        .max(6);
 
     let original_heading = if show_original { "  ORIGINAL" } else { "" };
     println!(
-        "{:<apk_width$}  {:<dex_width$}  TYPE  {:<descriptor_width$}{original_heading}  SOURCE",
-        "APK", "DEX", "DESCRIPTOR"
+        "{:<apk_width$}  {:<dex_width$}  TYPE  {:<symbol_width$}{original_heading}  SOURCE",
+        "APK", "DEX", "SYMBOL"
     );
 
     for row in output {
@@ -93,11 +93,11 @@ fn print_aligned(output: &[Row], show_original: bool) {
             String::new()
         };
         println!(
-            "{:<apk_width$}  {:<dex_width$}  {:<4}  {:<descriptor_width$}{}  {}",
+            "{:<apk_width$}  {:<dex_width$}  {:<4}  {:<symbol_width$}{}  {}",
             row.apk,
             row.dex,
             row.kind,
-            row.descriptor,
+            row.symbol,
             original,
             row.source.as_deref().unwrap_or("-")
         );
@@ -109,7 +109,7 @@ pub(super) fn push_aliases(
     apk: &str,
     dex: &str,
     kind: char,
-    descriptor: String,
+    symbol: String,
     originals: Vec<String>,
     source: Option<&str>,
 ) {
@@ -118,7 +118,7 @@ pub(super) fn push_aliases(
             apk: apk.to_owned(),
             dex: dex.to_owned(),
             kind,
-            descriptor,
+            symbol,
             original: None,
             source: source.map(str::to_owned),
         });
@@ -128,7 +128,7 @@ pub(super) fn push_aliases(
                 apk: apk.to_owned(),
                 dex: dex.to_owned(),
                 kind,
-                descriptor: descriptor.clone(),
+                symbol: symbol.clone(),
                 original: Some(original),
                 source: source.map(str::to_owned),
             });

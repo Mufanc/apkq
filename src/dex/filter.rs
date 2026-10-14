@@ -80,11 +80,11 @@ impl ResolvedFilter {
                     .iter()
                     .map(|&string_idx| {
                         strings.get(string_idx).is_some_and(|value| {
-                            value == query
+                            value == query.descriptor()
                                 || filter
                                     .mapping
                                     .and_then(|mapping| mapping.original_class(value))
-                                    .is_some_and(|alias| alias == query)
+                                    .is_some_and(|alias| alias == query.descriptor())
                         })
                     })
                     .collect()

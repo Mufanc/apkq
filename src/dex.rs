@@ -11,7 +11,7 @@ mod format;
 pub mod mapping;
 mod opcode;
 mod parse;
-use crate::query::{CallQuery, FieldQuery};
+use crate::java::{JavaField, JavaMethod, JavaType};
 use mapping::Mapping;
 
 #[derive(Debug)]
@@ -30,9 +30,9 @@ pub struct DexIndex {
 
 pub struct ReferenceFilter<'a> {
     pub strings: &'a [String],
-    pub calls: &'a [CallQuery],
-    pub types: &'a [String],
-    pub fields: &'a [FieldQuery],
+    pub calls: &'a [JavaMethod],
+    pub types: &'a [JavaType],
+    pub fields: &'a [JavaField],
     pub mapping: Option<&'a Mapping>,
 }
 
