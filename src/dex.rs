@@ -70,7 +70,7 @@ pub fn index_apk(apk: &Path, filter: Option<&ReferenceFilter<'_>>) -> Result<Dex
 
 pub fn prepare_apk(apk: &Path) -> Result<PreparedArchive, String> {
     if !apk.is_file() {
-        return Err(format!("APK does not exist: {}", apk.display()));
+        return Err(format!("input is not a file: {}", apk.display()));
     }
 
     let bytes = fs::read(apk).map_err(|error| format!("{}: {error}", apk.display()))?;
@@ -164,7 +164,7 @@ fn index_archive(
 
 fn open_archive<'a>(bytes: &'a [u8], label: &str) -> Result<ZipArchive<Cursor<&'a [u8]>>, String> {
     ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
-        let label = if label.is_empty() { "APK" } else { label };
+        let label = if label.is_empty() { "input" } else { label };
         format!("invalid ZIP archive {label}: {error}")
     })
 }

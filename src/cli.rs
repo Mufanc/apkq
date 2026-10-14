@@ -236,7 +236,7 @@ fn run(cli: Cli) -> Result<(), String> {
         );
     }
 
-    let apk = validate_apk(&cli.input)?;
+    let apk = &cli.input;
     let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
     let mut output = Vec::new();
     let started = Instant::now();
@@ -263,7 +263,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         _ => None,
     };
-    let index = dex::index_apk(&apk, filter.as_ref())?;
+    let index = dex::index_apk(apk, filter.as_ref())?;
 
     match &cli.command {
         Command::Classes {
@@ -432,9 +432,8 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn run_resources(input: &Path, query: Query<'_>, json: bool, aligned: bool) -> Result<(), String> {
-    let apk = validate_apk(input)?;
     let started = Instant::now();
-    let mut rows = resource::index_apk(&apk, &query)?;
+    let mut rows = resource::index_apk(input, &query)?;
 
     rows.sort();
     rows.dedup();
@@ -581,18 +580,6 @@ fn valid_name_part(value: &str) -> bool {
         && value
             .chars()
             .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
-}
-
-fn validate_apk(input: &Path) -> Result<PathBuf, String> {
-    if !input.is_file()
-        || !input
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
-    {
-        return Err(format!("input is not an APK file: {}", input.display()));
-    }
-
-    Ok(input.to_owned())
 }
 
 #[cfg(test)]
