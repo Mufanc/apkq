@@ -30,7 +30,7 @@ use output::{Row, print_output, print_resources, push_aliases};
   dexq m ./apks --mapping 'mapping.zip!path/to/mapping.txt' --json
 
 Input: an APK or a directory searched recursively for APKs; nested APKs are searched too. Standalone DEX, JAR and AAR files are unsupported.
-Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), DESCRIPTOR, ORIGINAL, SOURCE. Resource rows include APK, nested ARCHIVE, ID, PACKAGE, TYPE, NAME, CONFIG, VALUE, PATH and reference location.
+Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain APK, DEX, TYPE (C/F/M), DESCRIPTOR, optional ORIGINAL, and SOURCE. Resource rows contain APK, nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
 Mapping: --mapping mapping.txt or --mapping 'mapping.zip!path/to/mapping.txt'. Mapped class/member names can be used in queries and appear in output.
 Scope: DEX definitions, explicit code references, compiled resource values and XML attributes; no decompilation, reflection or runtime-generated strings.
 Run 'dexq <command> --help' for query syntax."#
@@ -73,7 +73,7 @@ enum Command {
         visible_alias = "r",
         after_help = r#"Resources are read from resources.arsc in each APK, including embedded APKs. IDs are scoped to their containing APK.
 --type limits returned resource types, for example string, id, or layout. --name is exact; --name-contains and --value are case-sensitive substrings. --value-regex uses Rust regex syntax. Filters are ANDed.
---uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. XML results include node, attribute, view ID and source line. It does not scan DEX code or resolve runtime references.
+--uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. USAGE identifies the table value or XML view ID and attribute. It does not scan DEX code or resolve runtime references.
 
 Examples:
   dexq r app.apk --type string --value 'Login failed'
@@ -449,7 +449,12 @@ fn run(cli: Cli) -> Result<(), String> {
     output.sort();
     output.dedup();
 
-    print_output(&output, common.json, common.aligned)?;
+    print_output(
+        &output,
+        common.json,
+        common.aligned,
+        common.mapping.is_some(),
+    )?;
 
     eprintln!(
         "searched in {:.3}s; {} match(es)",

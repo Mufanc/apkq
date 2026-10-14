@@ -11,7 +11,12 @@ pub(super) struct Row {
     pub(super) source: Option<String>,
 }
 
-pub(super) fn print_output(output: &[Row], json: bool, aligned: bool) -> Result<(), String> {
+pub(super) fn print_output(
+    output: &[Row],
+    json: bool,
+    aligned: bool,
+    show_original: bool,
+) -> Result<(), String> {
     if json {
         let values = output
             .iter()
@@ -28,27 +33,34 @@ pub(super) fn print_output(output: &[Row], json: bool, aligned: bool) -> Result<
             serde_json::to_string(&values).map_err(|error| error.to_string())?
         );
     } else if aligned {
-        print_aligned(output);
+        print_aligned(output, show_original);
     } else {
-        println!("APK\tDEX\tTYPE\tDESCRIPTOR\tORIGINAL\tSOURCE");
+        let heading = if show_original {
+            "APK\tDEX\tTYPE\tDESCRIPTOR\tORIGINAL\tSOURCE"
+        } else {
+            "APK\tDEX\tTYPE\tDESCRIPTOR\tSOURCE"
+        };
+        println!("{heading}");
 
         for row in output {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+            let mut fields = vec![
                 tsv(&row.apk),
                 tsv(&row.dex),
-                row.kind,
+                row.kind.to_string(),
                 tsv(&row.descriptor),
-                tsv(row.original.as_deref().unwrap_or_default()),
-                tsv(row.source.as_deref().unwrap_or_default())
-            );
+            ];
+            if show_original {
+                fields.push(tsv(row.original.as_deref().unwrap_or("-")));
+            }
+            fields.push(tsv(row.source.as_deref().unwrap_or("-")));
+            println!("{}", fields.join("\t"));
         }
     }
 
     Ok(())
 }
 
-fn print_aligned(output: &[Row]) {
+fn print_aligned(output: &[Row], show_original: bool) {
     let apk_width = output
         .iter()
         .map(|row| row.apk.chars().count())
@@ -68,20 +80,26 @@ fn print_aligned(output: &[Row]) {
         .unwrap_or(10)
         .max(10);
 
+    let original_heading = if show_original { "  ORIGINAL" } else { "" };
     println!(
-        "{:<apk_width$}  {:<dex_width$}  TYPE  {:<descriptor_width$}  ORIGINAL  SOURCE",
+        "{:<apk_width$}  {:<dex_width$}  TYPE  {:<descriptor_width$}{original_heading}  SOURCE",
         "APK", "DEX", "DESCRIPTOR"
     );
 
     for row in output {
+        let original = if show_original {
+            format!("  {}", row.original.as_deref().unwrap_or("-"))
+        } else {
+            String::new()
+        };
         println!(
-            "{:<apk_width$}  {:<dex_width$}  {:<4}  {:<descriptor_width$}  {}  {}",
+            "{:<apk_width$}  {:<dex_width$}  {:<4}  {:<descriptor_width$}{}  {}",
             row.apk,
             row.dex,
             row.kind,
             row.descriptor,
-            row.original.as_deref().unwrap_or_default(),
-            row.source.as_deref().unwrap_or_default()
+            original,
+            row.source.as_deref().unwrap_or("-")
         );
     }
 }
@@ -132,13 +150,17 @@ pub(super) fn print_resources(
     aligned: bool,
 ) -> Result<(), String> {
     if json_output {
-        let values = rows.iter().map(|(apk, row)| json!({
-            "apk": apk, "archive": row.archive, "id": format!("0x{:08x}", row.id),
-            "package": row.package, "type": row.kind, "name": row.name,
-            "original": row.original,
-            "config": row.config, "value": row.value, "path": row.path,
-            "node": row.node, "attribute": row.attribute, "view_id": row.view_id, "line": row.line,
-        })).collect::<Vec<_>>();
+        let values = rows
+            .iter()
+            .map(|(apk, row)| {
+                json!({
+                    "apk": apk, "archive": row.archive, "id": format!("0x{:08x}", row.id),
+                    "type": row.kind, "name": row.name,
+                    "config": row.config, "value": row.value, "path": row.path,
+                    "usage": row.usage,
+                })
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string(&values).map_err(|error| error.to_string())?
@@ -146,20 +168,7 @@ pub(super) fn print_resources(
         return Ok(());
     }
     let headings = [
-        "APK",
-        "ARCHIVE",
-        "ID",
-        "PACKAGE",
-        "TYPE",
-        "NAME",
-        "ORIGINAL",
-        "CONFIG",
-        "VALUE",
-        "PATH",
-        "NODE",
-        "ATTRIBUTE",
-        "VIEW_ID",
-        "LINE",
+        "APK", "ARCHIVE", "ID", "TYPE", "NAME", "CONFIG", "VALUE", "PATH", "USAGE",
     ];
     let fields = rows
         .iter()
@@ -168,17 +177,12 @@ pub(super) fn print_resources(
                 (*apk).to_owned(),
                 row.archive.clone(),
                 format!("0x{:08x}", row.id),
-                row.package.clone(),
                 row.kind.clone(),
                 row.name.clone(),
-                row.original.clone().unwrap_or_default(),
                 row.config.clone(),
-                row.value.clone(),
-                row.path.clone().unwrap_or_default(),
-                row.node.clone().unwrap_or_default(),
-                row.attribute.clone().unwrap_or_default(),
-                row.view_id.clone().unwrap_or_default(),
-                row.line.map(|line| line.to_string()).unwrap_or_default(),
+                non_empty(&row.value),
+                row.path.clone().unwrap_or_else(|| "-".to_owned()),
+                row.usage.clone().unwrap_or_else(|| "-".to_owned()),
             ]
         })
         .collect::<Vec<_>>();
@@ -225,4 +229,8 @@ pub(super) fn print_resources(
         }
     }
     Ok(())
+}
+
+fn non_empty(value: &str) -> String {
+    if value.is_empty() { "-" } else { value }.to_owned()
 }

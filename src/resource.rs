@@ -26,17 +26,12 @@ pub struct Query<'a> {
 pub struct Location {
     pub archive: String,
     pub id: u32,
-    pub package: String,
     pub kind: String,
     pub name: String,
-    pub original: Option<String>,
     pub config: String,
     pub value: String,
     pub path: Option<String>,
-    pub node: Option<String>,
-    pub attribute: Option<String>,
-    pub view_id: Option<String>,
-    pub line: Option<u32>,
+    pub usage: Option<String>,
 }
 
 pub fn parse_id(text: &str) -> Result<u32, String> {
@@ -104,6 +99,7 @@ fn index_archive(
     let mut archive = ZipArchive::new(Cursor::new(prepared.bytes.as_slice()))
         .map_err(|error| format!("{}: {error}", prepared.label))?;
     let mut bytes = Vec::new();
+
     match archive.by_name("resources.arsc") {
         Ok(mut entry) => entry
             .read_to_end(&mut bytes)
@@ -111,6 +107,7 @@ fn index_archive(
         Err(zip::result::ZipError::FileNotFound) => 0,
         Err(error) => return Err(format!("{}!resources.arsc: {error}", prepared.label)),
     };
+
     if !bytes.is_empty() {
         let resources = format::parse(&bytes)
             .map_err(|error| format!("{}!resources.arsc: {error}", prepared.label))?;
@@ -152,33 +149,29 @@ fn index_archive(
             {
                 continue;
             }
-            let location = |node: Option<String>,
-                            attribute: Option<String>,
-                            view_id: Option<String>,
-                            line: Option<u32>| Location {
+
+            let location = |usage: Option<String>| Location {
                 archive: prepared.label.clone(),
                 id: resource.id,
-                package: resource.package.clone(),
                 kind: resource.kind.clone(),
                 name: resource.name.clone(),
-                original: original.map(str::to_owned),
                 config: resource.config.clone(),
                 value: resource.value.clone(),
                 path: resource.path.clone(),
-                node,
-                attribute,
-                view_id,
-                line,
+                usage,
             };
+
             if let Some(targets) = &targets {
                 if targets.is_empty() {
                     continue;
                 }
+                
                 for (attribute, reference) in &resource.references {
                     if targets.contains(reference) {
-                        output.push(location(None, Some(attribute.clone()), None, None));
+                        output.push(location(Some(attribute.clone())));
                     }
                 }
+
                 if let Some(path) = resource.path.as_ref().filter(|path| path.ends_with(".xml")) {
                     if !xml_cache.contains_key(path) {
                         let mut xml_bytes = Vec::new();
@@ -191,6 +184,7 @@ fn index_archive(
                             .map_err(|error| format!("{}!{path}: {error}", prepared.label))?;
                         xml_cache.insert(path.clone(), hits);
                     }
+
                     for hit in &xml_cache[path] {
                         let view_id = hit.view_id.map(|id| {
                             names
@@ -198,16 +192,14 @@ fn index_archive(
                                 .cloned()
                                 .unwrap_or_else(|| format!("0x{id:08x}"))
                         });
-                        output.push(location(
-                            Some(hit.node.clone()),
-                            Some(hit.attribute.clone()),
-                            view_id,
-                            Some(hit.line),
-                        ));
+                        let usage = view_id
+                            .map(|view_id| format!("{view_id}@{}", hit.attribute))
+                            .unwrap_or_else(|| hit.attribute.clone());
+                        output.push(location(Some(usage)));
                     }
                 }
             } else {
-                output.push(location(None, None, None, None));
+                output.push(location(None));
             }
         }
     }

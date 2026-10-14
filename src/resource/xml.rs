@@ -9,32 +9,14 @@ const NO_INDEX: u32 = u32::MAX;
 const ANDROID_NAMESPACE: &str = "http://schemas.android.com/apk/res/android";
 
 pub(super) struct Hit {
-    pub(super) node: String,
     pub(super) attribute: String,
     pub(super) view_id: Option<u32>,
-    pub(super) line: u32,
 }
 
 fn text(pool: &[String], index: u32) -> Result<&str, String> {
     pool.get(index as usize)
         .map(String::as_str)
         .ok_or("binary XML string index is out of bounds".to_owned())
-}
-
-struct XmlNode {
-    line: u32,
-}
-
-impl XmlNode {
-    fn parse(view: ByteView<'_>, chunk: Chunk) -> Result<Self, String> {
-        if chunk.header_size < XML_NODE_HEADER_SIZE {
-            return Err("invalid binary XML node".to_owned());
-        }
-
-        Ok(Self {
-            line: view.u32(chunk.start + 8)?,
-        })
-    }
 }
 
 struct XmlAttribute {
@@ -56,8 +38,6 @@ impl XmlAttribute {
 }
 
 struct XmlStartElement {
-    node: XmlNode,
-    name_index: u32,
     attributes: Vec<XmlAttribute>,
 }
 
@@ -97,11 +77,7 @@ impl XmlStartElement {
             .map(|index| XmlAttribute::parse(view, start + index * attribute_size))
             .collect::<Result<_, _>>()?;
 
-        Ok(Self {
-            node: XmlNode::parse(view, chunk)?,
-            name_index: view.u32(chunk.start + 20)?,
-            attributes,
-        })
+        Ok(Self { attributes })
     }
 }
 
@@ -113,7 +89,7 @@ pub(super) fn references(bytes: &[u8], targets: &HashSet<u32>) -> Result<Vec<Hit
     }
 
     let mut pool = Vec::new();
-    let mut path = Vec::<String>::new();
+    let mut depth = 0usize;
     let mut hits = Vec::new();
     let mut cursor = xml.body();
 
@@ -123,9 +99,7 @@ pub(super) fn references(bytes: &[u8], targets: &HashSet<u32>) -> Result<Vec<Hit
             XmlChunkKind::StringPool => pool = StringPool::parse(bytes, item)?.into_values(),
             XmlChunkKind::StartElement => {
                 let element = XmlStartElement::parse(bytes, item)?;
-                let name = text(&pool, element.name_index)?.to_owned();
-
-                path.push(name);
+                depth += 1;
 
                 let mut view_id = None;
                 let mut matched = Vec::new();
@@ -161,27 +135,23 @@ pub(super) fn references(bytes: &[u8], targets: &HashSet<u32>) -> Result<Vec<Hit
                     }
                 }
 
-                let node = path.join("/");
-
                 for attribute in matched {
-                    hits.push(Hit {
-                        node: node.clone(),
-                        attribute,
-                        view_id,
-                        line: element.node.line,
-                    });
+                    hits.push(Hit { attribute, view_id });
                 }
             }
-            XmlChunkKind::EndElement if path.pop().is_none() => {
+            XmlChunkKind::EndElement if depth == 0 => {
                 return Err("binary XML has unmatched end element".to_owned());
             }
+            XmlChunkKind::EndElement => depth -= 1,
             _ => {}
         }
         cursor = item.end;
     }
-    if !path.is_empty() {
+    
+    if depth != 0 {
         return Err("binary XML has unclosed elements".to_owned());
     }
+
     Ok(hits)
 }
 
@@ -248,9 +218,7 @@ mod tests {
 
         let hits = references(&xml, &HashSet::from([0x7f010001])).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].node, "TextView");
         assert_eq!(hits[0].attribute, "android:id");
         assert_eq!(hits[0].view_id, Some(0x7f010001));
-        assert_eq!(hits[0].line, 7);
     }
 }
