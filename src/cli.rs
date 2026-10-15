@@ -29,7 +29,7 @@ use output::{Row, print_output, print_resources, push_aliases};
   apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
-Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain nested ARCHIVE, ID, TYPE, NAME, CONFIG, VALUE, PATH, and USAGE.
+Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain nested ARCHIVE, ID, TYPE, NAME, optional ORIGINAL, CONFIG, VALUE, PATH, and USAGE.
 Mapping: --mapping accepts a file or 'archive.zip!entry'. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings.
 Search covers DEX definitions and references, compiled resource values, and XML attributes.
 Run 'apkq <apk> <command> --help' for query syntax."#
@@ -433,11 +433,12 @@ fn run(cli: Cli) -> Result<(), String> {
 
 fn run_resources(input: &Path, query: Query<'_>, json: bool, aligned: bool) -> Result<(), String> {
     let started = Instant::now();
+    let show_original = query.mapping.is_some();
     let mut rows = resource::index_apk(input, &query)?;
 
     rows.sort();
     rows.dedup();
-    print_resources(&rows, json, aligned)?;
+    print_resources(&rows, json, aligned, show_original)?;
 
     eprintln!(
         "searched in {:.3}s; {} match(es)",

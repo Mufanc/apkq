@@ -132,6 +132,7 @@ pub(super) fn print_resources(
     rows: &[Location],
     json_output: bool,
     aligned: bool,
+    show_original: bool,
 ) -> Result<(), String> {
     if json_output {
         let values = rows
@@ -139,7 +140,7 @@ pub(super) fn print_resources(
             .map(|row| {
                 json!({
                     "archive": row.archive, "id": format!("0x{:08x}", row.id),
-                    "type": row.kind, "name": row.name,
+                    "type": row.kind, "name": row.name, "original": row.original,
                     "config": row.config, "value": row.value, "path": row.path,
                     "usage": row.usage,
                 })
@@ -151,22 +152,31 @@ pub(super) fn print_resources(
         );
         return Ok(());
     }
-    let headings = [
-        "ARCHIVE", "ID", "TYPE", "NAME", "CONFIG", "VALUE", "PATH", "USAGE",
-    ];
+    let mut headings = vec!["ARCHIVE", "ID", "TYPE", "NAME"];
+    if show_original {
+        headings.push("ORIGINAL");
+    }
+    headings.extend(["CONFIG", "VALUE", "PATH", "USAGE"]);
+
     let fields = rows
         .iter()
         .map(|row| {
-            vec![
+            let mut fields = vec![
                 row.archive.clone(),
                 format!("0x{:08x}", row.id),
                 row.kind.clone(),
                 row.name.clone(),
+            ];
+            if show_original {
+                fields.push(row.original.clone().unwrap_or_else(|| "-".to_owned()));
+            }
+            fields.extend([
                 row.config.clone(),
                 non_empty(&row.value),
                 row.path.clone().unwrap_or_else(|| "-".to_owned()),
                 row.usage.clone().unwrap_or_else(|| "-".to_owned()),
-            ]
+            ]);
+            fields
         })
         .collect::<Vec<_>>();
     if aligned {
