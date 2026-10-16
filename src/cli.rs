@@ -56,13 +56,13 @@ enum Command {
     #[command(
         visible_alias = "r",
         after_help = r#"Resources are read from resources.arsc in each APK, including embedded APKs. IDs are scoped to their containing APK.
---type limits returned resource types, for example string, id, or layout. --name is exact; --name-contains and --value are case-sensitive substrings. --value-regex uses Rust regex syntax. Filters are ANDed.
+--type limits returned resource types, for example string, id, or layout. --name is exact; --name-regex and --value-regex use Rust regex syntax; --value is a case-sensitive substring. Filters are ANDed.
 --uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. USAGE identifies the table value or XML view ID and attribute.
 
 Examples:
   apkq app.apk r --type string --value 'Login failed'
   apkq app.apk r --type string --value-regex 'login|sign.?in'
-  apkq app.apk r --type id --name-contains button
+  apkq app.apk r --type id --name-regex 'button(_text)?$'
   apkq app.apk r --type layout --name activity_login
   apkq app.apk r --id 0x7f0a0012
   apkq app.apk r --type layout --uses-resource string/login_failed
@@ -75,9 +75,9 @@ Examples:
         /// Exact resource entry name
         #[arg(long, value_parser = non_empty)]
         name: Option<String>,
-        /// Case-sensitive resource name substring
-        #[arg(long, value_parser = non_empty)]
-        name_contains: Option<String>,
+        /// Rust regex matched against the resource name
+        #[arg(long)]
+        name_regex: Option<Regex>,
         /// Numeric resource ID, decimal or 0x-prefixed hexadecimal
         #[arg(long, value_parser = resource::parse_id)]
         id: Option<u32>,
@@ -95,14 +95,14 @@ Examples:
     #[command(
         visible_alias = "c",
         after_help = r#"With no filters, list all classes. Use full dotted names, not DEX descriptors.
---name is exact; use a trailing dot in --name-prefix for a package.
+--name is exact. --name-regex matches the full dotted class name using Rust regex syntax.
 --inherits finds direct and transitive subclasses and implementors; the base class is excluded.
 Filters are ANDed. With --mapping, class filters also match original names.
 
 Examples:
   apkq app.apk c --name com.example.MainActivity
-  apkq app.apk c --name-prefix com.example.
-  apkq app.apk c --simple-name MainActivity
+  apkq app.apk c --name-regex '^com\.example\.'
+  apkq app.apk c --name-regex '(Login|Register)Activity$'
   apkq app.apk c --inherits android.app.Activity
   apkq app.apk --mapping mapping.txt c --inherits com.example.ItemBase"#
     )]
@@ -110,15 +110,9 @@ Examples:
         /// Exact class name
         #[arg(long)]
         name: Option<JavaClass>,
-        #[arg(
-            long = "name-prefix",
-            value_parser = parse_class_prefix,
-            help = "Class name prefix, such as com.example."
-        )]
-        name_prefix: Option<String>,
-        /// Exact class name without its package, such as MainActivity
-        #[arg(long, value_parser = parse_simple_name)]
-        simple_name: Option<String>,
+        /// Rust regex matched against the full dotted class name
+        #[arg(long)]
+        name_regex: Option<Regex>,
         /// Direct or transitive subclasses and implementors
         #[arg(long)]
         inherits: Option<JavaClass>,
@@ -126,11 +120,12 @@ Examples:
     /// Find field definitions
     #[command(
         visible_alias = "f",
-        after_help = r#"With no filters, list all fields. --class takes a full dotted class name; --name matches an exact field name. Both filters are ANDed.
+        after_help = r#"With no filters, list all fields. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax. Filters are ANDed.
 With --mapping, filters also match original class and field names.
 
 Examples:
   apkq app.apk f --class com.example.Config --name apiKey
+  apkq app.apk f --name-regex '^(is|has)[A-Z]'
   apkq app.apk --json f --name apiKey
   apkq app.apk --mapping mapping.txt f --name originalField"#
     )]
@@ -141,11 +136,14 @@ Examples:
         /// Exact field name
         #[arg(long)]
         name: Option<String>,
+        /// Rust regex matched against the field name
+        #[arg(long)]
+        name_regex: Option<Regex>,
     },
     /// Find method definitions; repeated reference filters are ANDed within one method
     #[command(
         visible_alias = "m",
-        after_help = r#"With no filters, list all methods. --class takes a full dotted class name; --name is exact; --has-field requires a field declared in that class.
+        after_help = r#"With no filters, list all methods. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax; --has-field requires a field declared in that class.
 All filters are ANDed. Repeated reference options require references within the same method.
 --uses-string matches case-sensitive substrings, including reads of initialized static string fields.
 --calls Class#name matches any overload; add (parameters):returnType for an exact signature.
@@ -156,6 +154,7 @@ Calls match explicit DEX invoke instructions.
 
 Examples:
   apkq app.apk m --name onCreate
+  apkq app.apk m --name-regex '^(get|set)[A-Z]'
   apkq app.apk m --class com.example.MainActivity --has-field apiKey
   apkq app.apk m --uses-string token --uses-string secret
   apkq app.apk m --calls 'com.example.Client#send'
@@ -172,6 +171,9 @@ Examples:
         /// Exact method name
         #[arg(long)]
         name: Option<String>,
+        /// Rust regex matched against the method name
+        #[arg(long)]
+        name_regex: Option<Regex>,
         /// Keep methods declared in classes with a field of this name
         #[arg(long)]
         has_field: Option<String>,
@@ -201,7 +203,7 @@ fn run(cli: Cli) -> Result<(), String> {
     if let Command::Resources {
         kind,
         name,
-        name_contains,
+        name_regex,
         id,
         value,
         value_regex,
@@ -220,7 +222,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 mapping: mapping.as_ref(),
                 kind: kind.as_deref(),
                 name: name.as_deref(),
-                name_contains: name_contains.as_deref(),
+                name_regex: name_regex.as_ref(),
                 id: *id,
                 value: value.as_deref(),
                 value_regex: value_regex
@@ -268,8 +270,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match &cli.command {
         Command::Classes {
             name,
-            name_prefix,
-            simple_name,
+            name_regex,
             inherits,
             ..
         } => {
@@ -281,10 +282,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 if !class_filters_match(
                     &class.class,
                     name.as_ref(),
-                    name_prefix.as_deref(),
-                    simple_name.as_deref(),
+                    name_regex.as_ref(),
                     mapping.as_ref(),
-                ) || descendants
+                )? || descendants
                     .as_ref()
                     .is_some_and(|descendants| !descendants.contains(class.class.as_str()))
                 {
@@ -305,7 +305,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 });
             }
         }
-        Command::Fields { class, name, .. } => {
+        Command::Fields {
+            class,
+            name,
+            name_regex,
+            ..
+        } => {
             for field in &index.fields {
                 if class
                     .as_ref()
@@ -313,6 +318,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     || name
                         .as_deref()
                         .is_some_and(|name| !field_name_matches(field, name, mapping.as_ref()))
+                    || name_regex.as_ref().is_some_and(|regex| {
+                        !field_name_regex_matches(field, regex, mapping.as_ref())
+                    })
                 {
                     continue;
                 }
@@ -354,6 +362,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Methods {
             class,
             name,
+            name_regex,
             has_field,
             ..
         } => {
@@ -373,6 +382,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     || name
                         .as_deref()
                         .is_some_and(|name| !method_name_matches(method, name, mapping.as_ref()))
+                    || name_regex.as_ref().is_some_and(|regex| {
+                        !method_name_regex_matches(method, regex, mapping.as_ref())
+                    })
                     || field_classes
                         .as_ref()
                         .is_some_and(|classes| !classes.contains(method.class.as_str()))
@@ -458,27 +470,32 @@ fn class_matches(descriptor: &str, query: &JavaClass, mapping: Option<&Mapping>)
 fn class_filters_match(
     descriptor: &str,
     name: Option<&JavaClass>,
-    name_prefix: Option<&str>,
-    simple_name: Option<&str>,
+    name_regex: Option<&Regex>,
     mapping: Option<&Mapping>,
-) -> bool {
+) -> Result<bool, String> {
     let original = mapping.and_then(|mapping| mapping.original_class(descriptor));
     let names = [Some(descriptor), original];
 
-    name.is_none_or(|query| {
+    if !name.is_none_or(|query| {
         names
             .iter()
             .flatten()
             .any(|name| *name == query.descriptor())
-    }) && name_prefix
-        .is_none_or(|prefix| names.iter().flatten().any(|name| name.starts_with(prefix)))
-        && simple_name.is_none_or(|simple| {
-            names
-                .iter()
-                .flatten()
-                .filter_map(|name| descriptor_simple_name(name))
-                .any(|name| name == simple)
-        })
+    }) {
+        return Ok(false);
+    }
+
+    let Some(regex) = name_regex else {
+        return Ok(true);
+    };
+
+    for descriptor in names.iter().flatten() {
+        if regex.is_match(JavaClass::from_descriptor(descriptor)?.name()) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn method_name_matches(
@@ -495,6 +512,20 @@ fn method_name_matches(
         })
 }
 
+fn method_name_regex_matches(
+    method: &dex::MethodLocation,
+    regex: &Regex,
+    mapping: Option<&Mapping>,
+) -> bool {
+    regex.is_match(&method.method)
+        || mapping.is_some_and(|mapping| {
+            mapping
+                .methods(&method.class, &method.method, &method.descriptor)
+                .iter()
+                .any(|alias| regex.is_match(&alias.name))
+        })
+}
+
 fn field_name_matches(field: &dex::FieldLocation, query: &str, mapping: Option<&Mapping>) -> bool {
     field.field == query
         || mapping.is_some_and(|mapping| {
@@ -502,6 +533,20 @@ fn field_name_matches(field: &dex::FieldLocation, query: &str, mapping: Option<&
                 .fields(&field.class, &field.field, &field.descriptor)
                 .iter()
                 .any(|alias| alias.name == query)
+        })
+}
+
+fn field_name_regex_matches(
+    field: &dex::FieldLocation,
+    regex: &Regex,
+    mapping: Option<&Mapping>,
+) -> bool {
+    regex.is_match(&field.field)
+        || mapping.is_some_and(|mapping| {
+            mapping
+                .fields(&field.class, &field.field, &field.descriptor)
+                .iter()
+                .any(|alias| regex.is_match(&alias.name))
         })
 }
 
@@ -547,46 +592,16 @@ fn non_empty(value: &str) -> Result<String, String> {
     }
 }
 
-fn parse_class_prefix(value: &str) -> Result<String, String> {
-    let stem = value.strip_suffix('.').unwrap_or(value);
-    if !valid_dotted_name(stem) {
-        return Err(format!("invalid dotted class prefix: {value}"));
-    }
-
-    Ok(format!("L{}", value.replace('.', "/")))
-}
-
-fn parse_simple_name(value: &str) -> Result<String, String> {
-    if value.contains('.') || !valid_name_part(value) {
-        return Err(format!("invalid simple class name: {value}"));
-    }
-
-    Ok(value.to_owned())
-}
-
-fn descriptor_simple_name(descriptor: &str) -> Option<&str> {
-    descriptor
-        .strip_prefix('L')?
-        .strip_suffix(';')?
-        .rsplit('/')
-        .next()
-}
-
-fn valid_dotted_name(value: &str) -> bool {
-    value.split('.').all(valid_name_part)
-}
-
-fn valid_name_part(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use apkq::dex::mapping::Mapping;
+    use apkq::dex::{FieldLocation, MethodLocation};
     use clap::Parser;
+    use regex::Regex;
+
+    use super::{
+        Cli, Command, class_filters_match, field_name_regex_matches, method_name_regex_matches,
+    };
 
     #[test]
     fn accepts_short_command_aliases_and_combined_filters() {
@@ -603,18 +618,23 @@ mod tests {
             Command::Classes { .. }
         ));
         assert!(
-            Cli::try_parse_from(["apkq", "app.apk", "c", "--simple-name", "MainActivity"]).is_ok()
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "c",
+                "--name-regex",
+                "Main(Activity|Fragment)$"
+            ])
+            .is_ok()
         );
-        assert!(
-            Cli::try_parse_from(["apkq", "app.apk", "c", "--simple-name", "com.example.Main"])
-                .is_err()
-        );
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "c", "--name-regex", "["]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["apkq", "app.apk", "f", "--name", "apiKey"])
                 .unwrap()
                 .command,
             Command::Fields { .. }
         ));
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "f", "--name-regex", "^(is|has)"]).is_ok());
         let cli = Cli::try_parse_from([
             "apkq",
             "app.apk",
@@ -631,6 +651,9 @@ mod tests {
             matches!(cli.command, Command::Methods { strings, types, .. } if strings.len() == 2 && types.len() == 1)
         );
         assert!(Cli::try_parse_from(["apkq", "app.apk", "m", "--string", "legacy"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "m", "--name-regex", "^(get|set)"]).is_ok()
+        );
         assert!(
             Cli::try_parse_from(["apkq", "app.apk", "m", "--calls", "com.example.Client#send"])
                 .is_ok()
@@ -656,7 +679,58 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--id", "0x7f0a0012"]).is_ok());
         assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "r", "--name-regex", "^activity_"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--name-regex", "["]).is_err());
+        assert!(
             Cli::try_parse_from(["apkq", "app.apk", "r", "--uses-resource", "broken"]).is_err()
         );
+    }
+
+    #[test]
+    fn matches_class_regex_against_java_names() {
+        let package = Regex::new(r"^com\.example\.").unwrap();
+        let simple_name = Regex::new(r"MainActivity$").unwrap();
+
+        assert!(
+            class_filters_match("Lcom/example/MainActivity;", None, Some(&package), None).unwrap()
+        );
+        assert!(
+            class_filters_match("Lcom/example/MainActivity;", None, Some(&simple_name), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn matches_member_regex_against_original_names() {
+        let mapping = Mapping::parse(
+            "com.example.Type -> a.b:\n    int originalField -> c\n    void originalMethod() -> d\n",
+        )
+        .unwrap();
+        let field = FieldLocation {
+            dex: String::new(),
+            class: "La/b;".to_owned(),
+            field: "c".to_owned(),
+            descriptor: "I".to_owned(),
+            source_file: None,
+        };
+        let method = MethodLocation {
+            dex: String::new(),
+            class: "La/b;".to_owned(),
+            method: "d".to_owned(),
+            descriptor: "()V".to_owned(),
+            source_file: None,
+        };
+
+        assert!(field_name_regex_matches(
+            &field,
+            &Regex::new("^originalField$").unwrap(),
+            Some(&mapping)
+        ));
+        assert!(method_name_regex_matches(
+            &method,
+            &Regex::new("^originalMethod$").unwrap(),
+            Some(&mapping)
+        ));
     }
 }

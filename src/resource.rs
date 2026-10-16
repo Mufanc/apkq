@@ -15,7 +15,7 @@ pub struct Query<'a> {
     pub mapping: Option<&'a mapping::Mapping>,
     pub kind: Option<&'a str>,
     pub name: Option<&'a str>,
-    pub name_contains: Option<&'a str>,
+    pub name_regex: Option<&'a Regex>,
     pub id: Option<u32>,
     pub value: Option<&'a str>,
     pub value_regex: Option<&'a Regex>,
@@ -136,9 +136,9 @@ fn index_archive(
                 || query
                     .name
                     .is_some_and(|value| resource.name != value && original != Some(value))
-                || query.name_contains.is_some_and(|value| {
-                    !resource.name.contains(value)
-                        && !original.is_some_and(|name| name.contains(value))
+                || query.name_regex.is_some_and(|regex| {
+                    !regex.is_match(&resource.name)
+                        && !original.is_some_and(|name| regex.is_match(name))
                 })
                 || query.id.is_some_and(|value| resource.id != value)
                 || query

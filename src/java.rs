@@ -106,6 +106,10 @@ impl JavaClass {
     pub fn descriptor(&self) -> &str {
         &self.descriptor
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl FromStr for JavaClass {
