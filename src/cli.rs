@@ -9,7 +9,7 @@ use apkq::dex::mapping::{self, Mapping};
 use apkq::dex::{self, DexIndex, ReferenceFilter};
 use apkq::java::{JavaClass, JavaField, JavaMethod, JavaType};
 use apkq::resource::{self, Query};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use regex::Regex;
 
 mod output;
@@ -55,8 +55,8 @@ enum Command {
     /// Find Android resources and references in compiled XML
     #[command(
         visible_alias = "r",
-        after_help = r#"Resources are read from resources.arsc in each APK, including embedded APKs. IDs are scoped to their containing APK.
---type limits returned resource types, for example string, id, or layout. --name is exact; --name-regex and --value-regex use Rust regex syntax; --value is a case-sensitive substring. Filters are ANDed.
+        after_help = r#"Use --list to list all resources. Resources are read from resources.arsc in each APK, including embedded APKs. IDs are scoped to their containing APK.
+--type limits returned resource types, for example string, id, or layout. --name is exact; --name-regex and --value-regex use Rust regex syntax; --value is a case-sensitive substring. Exact and regex forms are alternatives. Filters are ANDed.
 --uses-resource finds resources that directly reference an ID in their table value or compiled XML attributes. Give a numeric ID (0x7f...), type/name, or package:type/name. USAGE identifies the table value or XML view ID and attribute.
 
 Examples:
@@ -69,11 +69,17 @@ Examples:
   apkq app.apk --json r --type layout --uses-resource 0x7f0a0012"#
     )]
     Resources {
+        /// List all resources
+        #[arg(
+            long,
+            conflicts_with_all = ["kind", "name", "name_regex", "id", "value", "value_regex", "uses_resource"]
+        )]
+        list: bool,
         /// Exact resource type, such as string, id, or layout
         #[arg(long = "type", value_parser = non_empty)]
         kind: Option<String>,
         /// Exact resource entry name
-        #[arg(long, value_parser = non_empty)]
+        #[arg(long, value_parser = non_empty, conflicts_with = "name_regex")]
         name: Option<String>,
         /// Rust regex matched against the resource name
         #[arg(long)]
@@ -82,7 +88,7 @@ Examples:
         #[arg(long, value_parser = resource::parse_id)]
         id: Option<u32>,
         /// Case-sensitive substring of decoded resource value
-        #[arg(long, value_parser = non_empty)]
+        #[arg(long, value_parser = non_empty, conflicts_with = "value_regex")]
         value: Option<String>,
         /// Regex for decoded resource value
         #[arg(long, value_parser = non_empty)]
@@ -94,8 +100,8 @@ Examples:
     /// Find class definitions
     #[command(
         visible_alias = "c",
-        after_help = r#"With no filters, list all classes. Use full dotted names, not DEX descriptors.
---name is exact. --name-regex matches the full dotted class name using Rust regex syntax.
+        after_help = r#"Use --list to list all classes. Use full dotted names, not DEX descriptors.
+--name is exact. --name-regex matches the full dotted class name using Rust regex syntax. They are alternatives.
 --inherits finds direct and transitive subclasses and implementors; the base class is excluded.
 Filters are ANDed. With --mapping, class filters also match original names.
 
@@ -107,8 +113,14 @@ Examples:
   apkq app.apk --mapping mapping.txt c --inherits com.example.ItemBase"#
     )]
     Classes {
+        /// List all classes
+        #[arg(
+            long,
+            conflicts_with_all = ["name", "name_regex", "inherits"]
+        )]
+        list: bool,
         /// Exact class name
-        #[arg(long)]
+        #[arg(long, conflicts_with = "name_regex")]
         name: Option<JavaClass>,
         /// Rust regex matched against the full dotted class name
         #[arg(long)]
@@ -120,7 +132,7 @@ Examples:
     /// Find field definitions
     #[command(
         visible_alias = "f",
-        after_help = r#"With no filters, list all fields. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax. Filters are ANDed.
+        after_help = r#"Use --list to list all fields. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax; the two name filters are alternatives. Filters are ANDed.
 With --mapping, filters also match original class and field names.
 
 Examples:
@@ -130,11 +142,17 @@ Examples:
   apkq app.apk --mapping mapping.txt f --name originalField"#
     )]
     Fields {
+        /// List all fields
+        #[arg(
+            long,
+            conflicts_with_all = ["class", "name", "name_regex"]
+        )]
+        list: bool,
         /// Exact declaring class name
         #[arg(long)]
         class: Option<JavaClass>,
         /// Exact field name
-        #[arg(long)]
+        #[arg(long, conflicts_with = "name_regex")]
         name: Option<String>,
         /// Rust regex matched against the field name
         #[arg(long)]
@@ -143,7 +161,7 @@ Examples:
     /// Find method definitions; repeated reference filters are ANDed within one method
     #[command(
         visible_alias = "m",
-        after_help = r#"With no filters, list all methods. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax; --has-field requires a field declared in that class.
+        after_help = r#"Use --list to list all methods. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax; the two name filters are alternatives. --has-field requires a field declared in that class.
 All filters are ANDed. Repeated reference options require references within the same method.
 --uses-string matches case-sensitive substrings, including reads of initialized static string fields.
 --calls Class#name matches any overload; add (parameters):returnType for an exact signature.
@@ -165,11 +183,17 @@ Examples:
   apkq app.apk --mapping mapping.txt m --calls 'com.example.Client#send'"#
     )]
     Methods {
+        /// List all methods
+        #[arg(
+            long,
+            conflicts_with_all = ["class", "name", "name_regex", "has_field", "strings", "calls", "types", "fields"]
+        )]
+        list: bool,
         /// Exact declaring class name
         #[arg(long)]
         class: Option<JavaClass>,
         /// Exact method name
-        #[arg(long)]
+        #[arg(long, conflicts_with = "name_regex")]
         name: Option<String>,
         /// Rust regex matched against the method name
         #[arg(long)]
@@ -192,8 +216,87 @@ Examples:
     },
 }
 
+impl Command {
+    fn has_query(&self) -> bool {
+        match self {
+            Self::Resources {
+                list,
+                kind,
+                name,
+                name_regex,
+                id,
+                value,
+                value_regex,
+                uses_resource,
+            } => {
+                *list
+                    || kind.is_some()
+                    || name.is_some()
+                    || name_regex.is_some()
+                    || id.is_some()
+                    || value.is_some()
+                    || value_regex.is_some()
+                    || uses_resource.is_some()
+            }
+            Self::Classes {
+                list,
+                name,
+                name_regex,
+                inherits,
+            } => *list || name.is_some() || name_regex.is_some() || inherits.is_some(),
+            Self::Fields {
+                list,
+                class,
+                name,
+                name_regex,
+            } => *list || class.is_some() || name.is_some() || name_regex.is_some(),
+            Self::Methods {
+                list,
+                class,
+                name,
+                name_regex,
+                has_field,
+                strings,
+                calls,
+                types,
+                fields,
+            } => {
+                *list
+                    || class.is_some()
+                    || name.is_some()
+                    || name_regex.is_some()
+                    || has_field.is_some()
+                    || !strings.is_empty()
+                    || !calls.is_empty()
+                    || !types.is_empty()
+                    || !fields.is_empty()
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Resources { .. } => "resources",
+            Self::Classes { .. } => "classes",
+            Self::Fields { .. } => "fields",
+            Self::Methods { .. } => "methods",
+        }
+    }
+}
+
 pub(super) fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let cli = Cli::parse();
+
+    if !cli.command.has_query() {
+        let error = Cli::command()
+            .try_get_matches_from(["apkq", "input.apk", cli.command.name(), "--help"])
+            .expect_err("missing help output");
+
+        error.print().expect("failed to print help");
+        return;
+    }
+
+    if let Err(error) = run(cli) {
         eprintln!("error: {error}");
         process::exit(1);
     }
@@ -208,6 +311,7 @@ fn run(cli: Cli) -> Result<(), String> {
         value,
         value_regex,
         uses_resource,
+        ..
     } = &cli.command
     {
         let mapping = cli
@@ -684,6 +788,97 @@ mod tests {
         assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--name-regex", "["]).is_err());
         assert!(
             Cli::try_parse_from(["apkq", "app.apk", "r", "--uses-resource", "broken"]).is_err()
+        );
+    }
+
+    #[test]
+    fn requires_a_query_or_list() {
+        for command in ["c", "f", "m", "r"] {
+            let cli = Cli::try_parse_from(["apkq", "app.apk", command]).unwrap();
+            assert!(!cli.command.has_query(), "{command}");
+
+            assert!(
+                Cli::try_parse_from(["apkq", "app.apk", command, "--list"])
+                    .unwrap()
+                    .command
+                    .has_query(),
+                "{command}"
+            );
+        }
+
+        let cli = Cli::try_parse_from(["apkq", "app.apk", "c", "--aligned"]).unwrap();
+        assert!(!cli.command.has_query());
+
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "c", "--list", "--name", "a.b"]).is_err());
+        assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "f", "--list", "--name", "field"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "m", "--list", "--name", "method"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["apkq", "app.apk", "r", "--list", "--type", "string"]).is_err()
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "c",
+                "--name",
+                "a.b",
+                "--name-regex",
+                "b$"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "f",
+                "--name",
+                "field",
+                "--name-regex",
+                "field"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "m",
+                "--name",
+                "method",
+                "--name-regex",
+                "method"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "r",
+                "--name",
+                "title",
+                "--name-regex",
+                "title"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "r",
+                "--value",
+                "Login",
+                "--value-regex",
+                "Login"
+            ])
+            .is_err()
         );
     }
 

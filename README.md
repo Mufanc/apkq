@@ -11,6 +11,7 @@ cargo build --release
 ## Queries
 
 ```sh
+apkq app.apk c --list
 apkq app.apk classes --name com.example.MainActivity
 apkq app.apk c --name-regex '^com\.example\.'
 apkq app.apk c --name-regex '(Login|Register)Activity$'
@@ -35,6 +36,8 @@ apkq app.apk --json r --type layout --uses-resource 0x7f0a0012
 ```
 
 `c`, `f`, `m`, and `r` are aliases for `classes`, `fields`, `methods`, and `resources`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
+
+Running a subcommand without a query prints its help. Use `--list` to return every item; `--list` cannot be combined with query filters. `--name` and `--name-regex` are alternatives. Resource `--value` and `--value-regex` are alternatives too.
 
 `resources` reads `resources.arsc`. `--type` limits the resource type in the result (`string`, `id`, `layout`, etc.); `--name` is exact, `--name-regex` searches resource names with Rust regex syntax, and `--value` is a case-sensitive substring. `--value-regex` searches decoded values with Rust regex syntax. `--id` accepts decimal or `0x` hexadecimal. Filters are combined with AND. `--uses-resource` accepts an ID, `type/name`, or `package:type/name` and finds direct references in table values and compiled XML attributes. XML hits include the node path, attribute, view ID when present, and source line. IDs and symbolic names are resolved separately in each nested APK.
 
