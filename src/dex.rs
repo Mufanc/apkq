@@ -105,7 +105,10 @@ fn prepare_archive_at(bytes: Vec<u8>, label: &str) -> Result<PreparedArchive, St
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("invalid ZIP entry in {label}: {error}"))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| format!("invalid ZIP entry name in {label}: {error}"))?
+            .into_owned();
 
         if is_nested_archive(&name) {
             let nested_bytes = read_entry(&mut entry, &name, label)?;
@@ -148,8 +151,12 @@ fn index_archive(
         let mut entry = archive
             .by_index(entry_index)
             .map_err(|error| format!("invalid ZIP entry in {}: {error}", prepared.label))?;
-        if is_classes_dex(entry.name()) {
-            let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| format!("invalid ZIP entry name in {}: {error}", prepared.label))?
+            .into_owned();
+
+        if is_classes_dex(&name) {
             let bytes = read_dex_entry(&prepared.bytes, &mut entry, &name, &prepared.label)?;
             parse::parse_dex(bytes, &join_label(&prepared.label, &name), filter, index)?;
         }
