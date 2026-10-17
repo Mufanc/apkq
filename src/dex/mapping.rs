@@ -2,26 +2,65 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::io::{Cursor, Read};
 
-use crate::input;
+use rkyv::rancor::Error;
+use rkyv::{Archive, Serialize};
+
+use crate::mapping_cache::{self, Cache};
 #[cfg(test)]
 use zip::ZipArchive;
 
 #[derive(Debug)]
 pub struct Mapping {
+    data: Cache<MappingData>,
+}
+
+#[derive(Archive, Debug, Serialize)]
+struct MappingData {
     classes: HashMap<String, ClassMapping>,
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize)]
 struct ClassMapping {
     original: String,
-    methods: HashMap<String, Vec<MemberMapping>>,
-    fields: HashMap<String, Vec<MemberMapping>>,
+    methods: HashMap<String, Vec<StoredMemberMapping>>,
+    fields: HashMap<String, Vec<StoredMemberMapping>>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct MemberMapping {
-    pub name: String,
-    pub descriptor: String,
+#[derive(Archive, Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct StoredMemberMapping {
+    name: String,
+    descriptor: String,
+}
+
+pub struct MemberMapping<'a> {
+    pub name: &'a str,
+    pub descriptor: &'a str,
+}
+
+pub struct MemberMappings<'a>(MemberMappingIter<'a>);
+
+enum MemberMappingIter<'a> {
+    Parsed(std::slice::Iter<'a, StoredMemberMapping>),
+    Archived(std::slice::Iter<'a, ArchivedStoredMemberMapping>),
+    Empty,
+}
+
+impl<'a> Iterator for MemberMappings<'a> {
+    type Item = MemberMapping<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            MemberMappingIter::Parsed(items) => items.next().map(|item| MemberMapping {
+                name: &item.name,
+                descriptor: &item.descriptor,
+            }),
+            MemberMappingIter::Archived(items) => items.next().map(|item| MemberMapping {
+                name: item.name.as_str(),
+                descriptor: item.descriptor.as_str(),
+            }),
+            MemberMappingIter::Empty => None,
+        }
+    }
 }
 
 impl Mapping {
@@ -84,39 +123,85 @@ impl Mapping {
             }
         }
 
-        Ok(Self { classes })
+        Ok(Self {
+            data: Cache::Parsed(MappingData { classes }),
+        })
     }
 
     pub fn original_class(&self, descriptor: &str) -> Option<&str> {
-        self.classes
-            .get(descriptor)
-            .map(|class| class.original.as_str())
+        match &self.data {
+            Cache::Parsed(mapping) => mapping
+                .classes
+                .get(descriptor)
+                .map(|class| class.original.as_str()),
+            Cache::Archived(bytes) => archived(bytes.as_ref())
+                .classes
+                .get(descriptor)
+                .map(|class| class.original.as_str()),
+        }
     }
 
-    pub fn methods(&self, class: &str, name: &str, descriptor: &str) -> &[MemberMapping] {
-        self.classes
-            .get(class)
-            .and_then(|class| class.methods.get(&member_key(name, descriptor)))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+    pub fn methods<'a>(&'a self, class: &str, name: &str, descriptor: &str) -> MemberMappings<'a> {
+        self.members(class, &member_key(name, descriptor), false)
     }
 
-    pub fn fields(&self, class: &str, name: &str, descriptor: &str) -> &[MemberMapping] {
-        self.classes
-            .get(class)
-            .and_then(|class| class.fields.get(&member_key(name, descriptor)))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+    pub fn fields<'a>(&'a self, class: &str, name: &str, descriptor: &str) -> MemberMappings<'a> {
+        self.members(class, &member_key(name, descriptor), true)
+    }
+
+    fn members<'a>(&'a self, class: &str, key: &str, fields: bool) -> MemberMappings<'a> {
+        match &self.data {
+            Cache::Parsed(mapping) => mapping
+                .classes
+                .get(class)
+                .and_then(|class| {
+                    if fields {
+                        class.fields.get(key)
+                    } else {
+                        class.methods.get(key)
+                    }
+                })
+                .map(|items| MemberMappings(MemberMappingIter::Parsed(items.iter())))
+                .unwrap_or(MemberMappings(MemberMappingIter::Empty)),
+            Cache::Archived(bytes) => archived(bytes.as_ref())
+                .classes
+                .get(class)
+                .and_then(|class| {
+                    if fields {
+                        class.fields.get(key)
+                    } else {
+                        class.methods.get(key)
+                    }
+                })
+                .map(|items| MemberMappings(MemberMappingIter::Archived(items.iter())))
+                .unwrap_or(MemberMappings(MemberMappingIter::Empty)),
+        }
     }
 }
 
 pub fn load(spec: &str) -> Result<Mapping, String> {
-    let bytes = input::read_file_spec(spec)?;
+    let data = mapping_cache::load(
+        "dex",
+        spec,
+        |bytes| {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| format!("mapping is not valid UTF-8: {error}"))?;
 
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|error| format!("mapping is not valid UTF-8: {error}"))?;
+            Mapping::parse(text).map(|mapping| match mapping.data {
+                Cache::Parsed(data) => data,
+                Cache::Archived(_) => unreachable!(),
+            })
+        },
+        |bytes| rkyv::access::<ArchivedMappingData, Error>(bytes).is_ok(),
+    )?;
 
-    Mapping::parse(text)
+    Ok(Mapping { data })
+}
+
+#[allow(unsafe_code)]
+fn archived(bytes: &[u8]) -> &ArchivedMappingData {
+    // SAFETY: ArchivedBytes is constructed only after validation and remains immutable.
+    unsafe { rkyv::access_unchecked(bytes) }
 }
 
 #[cfg(test)]
@@ -179,7 +264,7 @@ fn parse_member(
             .methods
             .entry(member_key(obfuscated.trim(), &obfuscated_descriptor))
             .or_default()
-            .push(MemberMapping {
+            .push(StoredMemberMapping {
                 name: name.to_owned(),
                 descriptor: original_descriptor,
             });
@@ -195,7 +280,7 @@ fn parse_member(
             .fields
             .entry(member_key(obfuscated.trim(), &obfuscated_descriptor))
             .or_default()
-            .push(MemberMapping {
+            .push(StoredMemberMapping {
                 name: name.to_owned(),
                 descriptor: original_descriptor,
             });
@@ -305,8 +390,14 @@ com.example.Model -> c.d:
             mapping.original_class("La/b;"),
             Some("Lcom/example/Outer$Inner;")
         );
-        assert_eq!(mapping.fields("La/b;", "c", "I")[0].name, "count");
-        let method = &mapping.methods("La/b;", "a", "(Lc/d;[I)Ljava/lang/String;")[0];
+        assert_eq!(
+            mapping.fields("La/b;", "c", "I").next().unwrap().name,
+            "count"
+        );
+        let method = mapping
+            .methods("La/b;", "a", "(Lc/d;[I)Ljava/lang/String;")
+            .next()
+            .unwrap();
         assert_eq!(method.name, "load");
         assert_eq!(
             method.descriptor,

@@ -437,15 +437,10 @@ fn run(cli: Cli) -> Result<(), String> {
                     .map(|mapping| {
                         mapping
                             .fields(&field.class, &field.field, &field.descriptor)
-                            .iter()
                             .filter_map(|alias| {
                                 mapping.original_class(&field.class).map(|owner| {
-                                    JavaField::from_descriptor(
-                                        owner,
-                                        &alias.name,
-                                        &alias.descriptor,
-                                    )
-                                    .map(|field| field.to_string())
+                                    JavaField::from_descriptor(owner, alias.name, alias.descriptor)
+                                        .map(|field| field.to_string())
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()
@@ -504,15 +499,10 @@ fn run(cli: Cli) -> Result<(), String> {
                     .map(|mapping| {
                         mapping
                             .methods(&method.class, &method.method, &method.descriptor)
-                            .iter()
                             .filter_map(|alias| {
                                 mapping.original_class(&method.class).map(|owner| {
-                                    JavaMethod::from_descriptor(
-                                        owner,
-                                        &alias.name,
-                                        &alias.descriptor,
-                                    )
-                                    .map(|method| method.to_string())
+                                    JavaMethod::from_descriptor(owner, alias.name, alias.descriptor)
+                                        .map(|method| method.to_string())
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()
@@ -611,7 +601,6 @@ fn method_name_matches(
         || mapping.is_some_and(|mapping| {
             mapping
                 .methods(&method.class, &method.method, &method.descriptor)
-                .iter()
                 .any(|alias| alias.name == query)
         })
 }
@@ -625,8 +614,7 @@ fn method_name_regex_matches(
         || mapping.is_some_and(|mapping| {
             mapping
                 .methods(&method.class, &method.method, &method.descriptor)
-                .iter()
-                .any(|alias| regex.is_match(&alias.name))
+                .any(|alias| regex.is_match(alias.name))
         })
 }
 
@@ -635,7 +623,6 @@ fn field_name_matches(field: &dex::FieldLocation, query: &str, mapping: Option<&
         || mapping.is_some_and(|mapping| {
             mapping
                 .fields(&field.class, &field.field, &field.descriptor)
-                .iter()
                 .any(|alias| alias.name == query)
         })
 }
@@ -649,8 +636,7 @@ fn field_name_regex_matches(
         || mapping.is_some_and(|mapping| {
             mapping
                 .fields(&field.class, &field.field, &field.descriptor)
-                .iter()
-                .any(|alias| regex.is_match(&alias.name))
+                .any(|alias| regex.is_match(alias.name))
         })
 }
 

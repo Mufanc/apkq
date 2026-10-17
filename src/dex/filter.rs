@@ -62,9 +62,8 @@ impl ResolvedFilter {
                                 mapping.original_class(&method.class).is_some_and(|class| {
                                     mapping
                                         .methods(&method.class, &method.name, &method.descriptor)
-                                        .iter()
                                         .any(|alias| {
-                                            query.matches(class, &alias.name, &alias.descriptor)
+                                            query.matches(class, alias.name, alias.descriptor)
                                         })
                                 })
                             })
@@ -102,9 +101,8 @@ impl ResolvedFilter {
                                 mapping.original_class(&field.class).is_some_and(|class| {
                                     mapping
                                         .fields(&field.class, &field.name, &field.descriptor)
-                                        .iter()
                                         .any(|alias| {
-                                            query.matches(class, &alias.name, &alias.descriptor)
+                                            query.matches(class, alias.name, alias.descriptor)
                                         })
                                 })
                             })
