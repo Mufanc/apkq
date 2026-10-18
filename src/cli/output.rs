@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 use apkq::resource::Location;
 use serde_json::json;
 
@@ -8,6 +11,53 @@ pub(super) struct Row {
     pub(super) symbol: String,
     pub(super) original: Option<String>,
     pub(super) source: Option<String>,
+}
+
+pub(super) fn print_decompiled(
+    dex: &str,
+    class: &str,
+    original: Option<&str>,
+    source: &str,
+    json_output: bool,
+    output: Option<&Path>,
+) -> Result<(), String> {
+    if json_output {
+        let mut rendered = serde_json::to_string(&json!({
+            "dex": dex,
+            "class": class,
+            "original": original,
+            "source": source,
+        }))
+        .map_err(|error| error.to_string())?;
+
+        rendered.push('\n');
+
+        return write_output(&rendered, output);
+    }
+
+    if let Some(path) = output {
+        let mut source = source.to_owned();
+
+        if !source.ends_with('\n') {
+            source.push('\n');
+        }
+
+        return fs::write(path, source).map_err(|error| format!("{}: {error}", path.display()));
+    }
+
+    println!("{}\n", source.trim_matches('\n'));
+
+    Ok(())
+}
+
+fn write_output(output: &str, path: Option<&Path>) -> Result<(), String> {
+    if let Some(path) = path {
+        return fs::write(path, output).map_err(|error| format!("{}: {error}", path.display()));
+    }
+
+    print!("{output}");
+
+    Ok(())
 }
 
 pub(super) fn print_output(

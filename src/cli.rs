@@ -26,6 +26,7 @@ use output::{Row, print_output, print_resources, push_aliases};
   apkq app.apk m --uses-string token
   apkq app.apk r --type string --value 'Login failed'
   apkq app.apk r --type layout --uses-resource string/login_failed
+  apkq app.apk d com.example.MainActivity
   apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
@@ -40,10 +41,10 @@ struct Cli {
     /// Mapping file, or ZIP entry as archive.zip!path/to/mapping.txt
     #[arg(long, global = true, value_name = "FILE[!ENTRY]")]
     mapping: Option<String>,
-    /// Emit a JSON array instead of TSV
+    /// Emit JSON instead of text output
     #[arg(long, global = true)]
     json: bool,
-    /// Align text columns instead of TSV
+    /// Align tabular text output
     #[arg(long, global = true, conflicts_with = "json")]
     aligned: bool,
     #[command(subcommand)]
@@ -52,6 +53,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Decompile one class to Java source
+    #[command(
+        visible_alias = "d",
+        after_help = r#"CLASS accepts a dotted Java name or DEX descriptor. Embedded APKs are searched recursively. If more than one DEX defines the class, rerun with --dex using a location from the error.
+With --mapping, CLASS may be an original or obfuscated name. The mapping selects the class but does not rewrite the generated source.
+Source is written to stdout, or to --output. With --json, the output contains dex, class, original, and source.
+
+Examples:
+  apkq app.apk d com.example.MainActivity
+  apkq app.apk d 'Lcom/example/MainActivity;'
+  apkq app.apk d com.example.MainActivity --dex classes3.dex
+  apkq app.apk d com.example.MainActivity --dex 'assets/plugin.apk!classes.dex'
+  apkq app.apk --mapping mapping.txt d com.example.MainActivity
+  apkq app.apk --json d com.example.MainActivity
+  apkq app.apk d com.example.MainActivity -o MainActivity.java"#
+    )]
+    Decompile {
+        /// Dotted Java class name or DEX descriptor
+        #[arg(value_parser = parse_decompile_class)]
+        class: JavaClass,
+        /// Exact DEX location, such as classes2.dex or assets/plugin.apk!classes.dex
+        #[arg(long)]
+        dex: Option<String>,
+        /// Write source or JSON output to this file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Find Android resources and references in compiled XML
     #[command(
         visible_alias = "r",
@@ -219,6 +247,7 @@ Examples:
 impl Command {
     fn has_query(&self) -> bool {
         match self {
+            Self::Decompile { .. } => true,
             Self::Resources {
                 list,
                 kind,
@@ -276,6 +305,7 @@ impl Command {
 
     fn name(&self) -> &'static str {
         match self {
+            Self::Decompile { .. } => "decompile",
             Self::Resources { .. } => "resources",
             Self::Classes { .. } => "classes",
             Self::Fields { .. } => "fields",
@@ -303,6 +333,62 @@ pub(super) fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if let Command::Decompile {
+        class,
+        dex: selected_dex,
+        output,
+    } = &cli.command
+    {
+        let started = Instant::now();
+        let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
+        let mut descriptors = vec![class.descriptor()];
+
+        if let Some(mapping) = &mapping {
+            descriptors.extend(mapping.obfuscated_classes(class.descriptor()));
+        }
+
+        descriptors.sort_unstable();
+        descriptors.dedup();
+
+        let matches = dex::decompile_apk(&cli.input, &descriptors, selected_dex.as_deref())?;
+        let result = match matches.as_slice() {
+            [] => return Err(format!("class {class} was not found")),
+            [result] => result,
+            matches => {
+                let locations = matches
+                    .iter()
+                    .map(|result| format!("  {}", result.dex))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                return Err(format!(
+                    "class {class} is ambiguous:\n{locations}\nselect one with --dex"
+                ));
+            }
+        };
+
+        let actual = JavaClass::from_descriptor(&result.descriptor)?.to_string();
+        let original = mapping
+            .as_ref()
+            .and_then(|mapping| mapping.original_class(&result.descriptor))
+            .map(JavaClass::from_descriptor)
+            .transpose()?
+            .map(|class| class.to_string());
+
+        output::print_decompiled(
+            &result.dex,
+            &actual,
+            original.as_deref(),
+            &result.source,
+            cli.json,
+            output.as_deref(),
+        )?;
+
+        eprintln!("decompiled in {:.3}s", started.elapsed().as_secs_f64());
+
+        return Ok(());
+    }
+
     if let Command::Resources {
         kind,
         name,
@@ -520,7 +606,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
             }
         }
-        Command::Resources { .. } => unreachable!(),
+        Command::Resources { .. } | Command::Decompile { .. } => unreachable!(),
     }
 
     output.sort();
@@ -682,6 +768,14 @@ fn non_empty(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_decompile_class(value: &str) -> Result<JavaClass, String> {
+    if value.starts_with('L') && value.ends_with(';') {
+        JavaClass::from_descriptor(value)
+    } else {
+        value.parse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use apkq::dex::mapping::Mapping;
@@ -700,6 +794,25 @@ mod tests {
                 .unwrap();
         assert!(cli.mapping.is_some() && cli.json);
         assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--aligned"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["apkq", "app.apk", "d", "Lcom/example/MainActivity;"])
+                .unwrap()
+                .command,
+            Command::Decompile { .. }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "decompile",
+                "com.example.MainActivity",
+                "--dex",
+                "assets/plugin.apk!classes.dex",
+                "-o",
+                "MainActivity.java"
+            ])
+            .is_ok()
+        );
 
         assert!(matches!(
             Cli::try_parse_from(["apkq", "app.apk", "c", "--inherits", "com.example.Base"])

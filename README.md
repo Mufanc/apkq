@@ -33,9 +33,13 @@ apkq app.apk r --type layout --name activity_login
 apkq app.apk r --id 0x7f0a0012
 apkq app.apk r --type layout --uses-resource string/login_failed
 apkq app.apk --json r --type layout --uses-resource 0x7f0a0012
+apkq app.apk d com.example.MainActivity
+apkq app.apk d com.example.MainActivity -o MainActivity.java
 ```
 
-`c`, `f`, `m`, and `r` are aliases for `classes`, `fields`, `methods`, and `resources`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
+`c`, `f`, `m`, `r`, and `d` are aliases for `classes`, `fields`, `methods`, `resources`, and `decompile`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
+
+`decompile` accepts a dotted class name or DEX descriptor and writes Java-like source to stdout. Use `-o` to write it to a file. If the same class occurs in multiple DEX files, use `--dex` with the exact nested DEX location. `--mapping` lets the command locate a class by its original name; generated source retains the names emitted by the decompiler.
 
 Running a subcommand without a query prints its help. Use `--list` to return every item; `--list` cannot be combined with query filters. `--name` and `--name-regex` are alternatives. Resource `--value` and `--value-regex` are alternatives too.
 
@@ -55,7 +59,7 @@ apkq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name origin
 - Method call queries match explicit DEX invoke instructions.
 - Resource reference queries match direct references in resource table values and compiled XML attributes.
 - Resource value queries support Rust regular expressions.
-- Use ASC or another decompiler to inspect matched classes and methods.
+- `decompile` emits one matched class as Java-like source.
 
 ## Code layout
 
@@ -63,3 +67,7 @@ apkq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name origin
 - `src/dex.rs` reads APK archives; `src/dex/parse.rs` reads DEX structures, `filter.rs` resolves query targets, and `code.rs` scans instructions.
 - `src/java.rs` parses and formats Java-style symbols; `src/dex/mapping.rs` reads R8/ProGuard mappings.
 - `src/resource.rs` queries resource tables and compiled XML.
+
+## Acknowledgements
+
+apkq's on-demand APK and DEX query workflow is inspired by [Droid ASC](https://github.com/MG1937/ASC), which demonstrated that compiled Android artifacts can be queried directly without building a global analysis database. Java-like class decompilation is provided by [droidsaw-dex](https://github.com/droidsaw/droidsaw-dex).

@@ -141,6 +141,25 @@ impl Mapping {
         }
     }
 
+    pub fn obfuscated_classes(&self, original: &str) -> Vec<&str> {
+        match &self.data {
+            Cache::Parsed(mapping) => mapping
+                .classes
+                .iter()
+                .filter_map(|(descriptor, class)| {
+                    (class.original == original).then_some(descriptor.as_str())
+                })
+                .collect(),
+            Cache::Archived(bytes) => archived(bytes.as_ref())
+                .classes
+                .iter()
+                .filter_map(|(descriptor, class)| {
+                    (class.original.as_str() == original).then_some(descriptor.as_str())
+                })
+                .collect(),
+        }
+    }
+
     pub fn methods<'a>(&'a self, class: &str, name: &str, descriptor: &str) -> MemberMappings<'a> {
         self.members(class, &member_key(name, descriptor), false)
     }
@@ -389,6 +408,10 @@ com.example.Model -> c.d:
         assert_eq!(
             mapping.original_class("La/b;"),
             Some("Lcom/example/Outer$Inner;")
+        );
+        assert_eq!(
+            mapping.obfuscated_classes("Lcom/example/Outer$Inner;"),
+            ["La/b;"]
         );
         assert_eq!(
             mapping.fields("La/b;", "c", "I").next().unwrap().name,

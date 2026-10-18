@@ -6,12 +6,15 @@ use std::path::Path;
 use zip::{CompressionMethod, ZipArchive};
 
 mod code;
+mod decompile;
 mod filter;
 mod format;
 pub mod mapping;
 mod opcode;
 mod parse;
+
 use crate::java::{JavaField, JavaMethod, JavaType};
+pub use decompile::{DecompiledClass, decompile_apk};
 use mapping::Mapping;
 
 #[derive(Debug)]
