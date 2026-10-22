@@ -48,6 +48,10 @@ impl<'a> Dex<'a> {
         Ok(Self { bytes, header })
     }
 
+    pub(super) fn into_bytes(self) -> Cow<'a, [u8]> {
+        self.bytes
+    }
+
     fn view(&self) -> DexView<'_> {
         DexView { bytes: &self.bytes }
     }
@@ -359,11 +363,15 @@ impl<'a> ClassDef<'a> {
     fn read(dex: DexView<'a>, offset: usize) -> Result<Self, String> {
         let mut cursor = Cursor::new(dex.bytes, offset)?;
         let class_index = cursor.read_u32()? as usize;
+
         cursor.read_u32()?;
+
         let superclass_index = cursor.read_u32()?;
         let interfaces_offset = cursor.read_u32()? as usize;
         let source_index = cursor.read_u32()?;
+
         cursor.read_u32()?;
+
         let class_data_offset = cursor.read_u32()? as usize;
         let static_values_offset = cursor.read_u32()? as usize;
 
@@ -470,6 +478,7 @@ impl<'a> ClassData<'a> {
             cursor.read_uleb128()? as usize,
             cursor.read_uleb128()? as usize,
         ];
+
         let method_counts = [
             cursor.read_uleb128()? as usize,
             cursor.read_uleb128()? as usize,
@@ -534,7 +543,9 @@ impl<'a> ClassData<'a> {
             .checked_add(self.cursor.read_uleb128()? as usize)
             .ok_or("method index overflow")?;
         self.cursor.read_uleb128()?;
+
         let code_offset = self.cursor.read_uleb128()? as usize;
+
         self.methods_read += 1;
 
         Ok(Some(EncodedMethod {
@@ -656,6 +667,7 @@ fn read_encoded_value(cursor: &mut Cursor<'_>) -> Result<EncodedValue, String> {
         )),
         VALUE_ARRAY => {
             let count = cursor.read_uleb128()?;
+
             for _ in 0..count {
                 read_encoded_value(cursor)?;
             }
@@ -664,7 +676,9 @@ fn read_encoded_value(cursor: &mut Cursor<'_>) -> Result<EncodedValue, String> {
         }
         VALUE_ANNOTATION => {
             cursor.read_uleb128()?;
+
             let count = cursor.read_uleb128()?;
+
             for _ in 0..count {
                 cursor.read_uleb128()?;
                 read_encoded_value(cursor)?;

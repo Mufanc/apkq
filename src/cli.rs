@@ -1,20 +1,23 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use apkq::dex::mapping::{self, Mapping};
-use apkq::dex::{self, DexIndex, ReferenceFilter};
+use apkq::archive::ApkArchive;
+use apkq::dex::mapping;
+use apkq::dex::{
+    self, DecompiledClass, DexIndex, DisassembleTarget, Disassembly, DisassemblyFormat,
+    ReferenceFilter,
+};
 use apkq::java::{JavaClass, JavaField, JavaMethod, JavaType};
 use apkq::resource::{self, Query};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use regex::Regex;
 
 mod output;
 
-use output::{Row, print_disassembled, print_output, print_resources, push_aliases};
+use output::Output;
 
 #[derive(Parser)]
 #[command(
@@ -31,7 +34,7 @@ use output::{Row, print_disassembled, print_output, print_resources, push_aliase
   apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
-Output: TSV by default; --json and --aligned are available. Timing and count go to stderr. Code rows contain DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain nested ARCHIVE, ID, TYPE, NAME, optional ORIGINAL, CONFIG, VALUE, PATH, and USAGE.
+Output: queries use TSV by default; --aligned follows c/f/m/r. --json is available for every command. Timing and count go to stderr. Code rows contain DEX, TYPE (C/F/M), SYMBOL, optional ORIGINAL, and SOURCE. Resource rows contain nested ARCHIVE, ID, TYPE, NAME, optional ORIGINAL, CONFIG, VALUE, PATH, and USAGE.
 Mapping: --mapping accepts a file or 'archive.zip!entry'. Code queries use R8/ProGuard mappings; resource queries use AndResGuard mappings.
 Search covers DEX definitions and references, compiled resource values, and XML attributes.
 Run 'apkq <apk> <command> --help' for query syntax."#
@@ -45,11 +48,95 @@ struct Cli {
     /// Emit JSON instead of text output
     #[arg(long, global = true)]
     json: bool,
-    /// Align tabular text output
-    #[arg(long, global = true, conflicts_with = "json")]
-    aligned: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+impl Cli {
+    fn parse_class(value: &str) -> Result<JavaClass, String> {
+        if value.starts_with('L') && value.ends_with(';') {
+            JavaClass::from_descriptor(value)
+        } else {
+            value.parse()
+        }
+    }
+
+    fn parse_method(value: &str) -> Result<JavaMethod, String> {
+        if value.contains("->") {
+            JavaMethod::from_descriptor(value)
+        } else {
+            value.parse()
+        }
+    }
+
+    fn parse_field(value: &str) -> Result<JavaField, String> {
+        if value.contains("->") {
+            JavaField::from_descriptor(value)
+        } else {
+            value.parse()
+        }
+    }
+
+    fn parse_type(value: &str) -> Result<JavaType, String> {
+        if value.starts_with('[')
+            || (value.starts_with('L') && value.ends_with(';'))
+            || matches!(value, "V" | "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D")
+        {
+            JavaType::from_descriptor(value)
+        } else {
+            value.parse()
+        }
+    }
+
+    fn parse_target(value: &str) -> Result<DisassembleTarget, String> {
+        if value.contains("->") || (value.starts_with('L') && value.ends_with(';')) {
+            DisassembleTarget::from_descriptor(value)
+        } else {
+            value.parse()
+        }
+    }
+
+    fn validate(&self) -> Result<(), clap::Error> {
+        if self.json && self.command.aligned() {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--json cannot be combined with --aligned",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Args, Default)]
+struct DexArgs {
+    /// Exact DEX location, such as classes2.dex or assets/plugin.apk!classes.dex
+    #[arg(long)]
+    dex: Option<String>,
+}
+
+#[derive(Args, Default)]
+struct TableArgs {
+    /// Align tabular text output
+    #[arg(long)]
+    aligned: bool,
+}
+
+#[derive(Args, Default)]
+struct OutputArgs {
+    /// Write output to this file instead of stdout
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Args, Default)]
+struct NameArgs {
+    /// Exact item name
+    #[arg(long, value_parser = non_empty, conflicts_with = "name_regex")]
+    name: Option<String>,
+    /// Rust regex matched against the item name
+    #[arg(long)]
+    name_regex: Option<Regex>,
 }
 
 #[derive(Subcommand)]
@@ -58,8 +145,8 @@ enum Command {
     #[command(
         visible_alias = "d",
         after_help = r#"CLASS accepts a dotted Java name or DEX descriptor. Embedded APKs are searched recursively. If more than one DEX defines the class, rerun with --dex using a location from the error.
-With --mapping, CLASS may be an original or obfuscated name. The mapping selects the class but does not rewrite the generated source.
-Source is written to stdout, or to --output. With --json, the output contains dex, class, original, and source.
+With --mapping, CLASS may be an original or obfuscated name. Output uses actual APK symbols.
+Source is written to stdout, or to --output. With --json, the output contains dex, class, and source.
 
 Examples:
   apkq app.apk d com.example.MainActivity
@@ -72,36 +159,36 @@ Examples:
     )]
     Decompile {
         /// Dotted Java class name or DEX descriptor
-        #[arg(value_parser = parse_decompile_class)]
+        #[arg(value_parser = Cli::parse_class)]
         class: JavaClass,
-        /// Exact DEX location, such as classes2.dex or assets/plugin.apk!classes.dex
-        #[arg(long)]
-        dex: Option<String>,
-        /// Write source or JSON output to this file instead of stdout
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+        #[command(flatten)]
+        dex: DexArgs,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Disassemble a class or method with DEX program counters
     #[command(
         visible_alias = "x",
-        after_help = r#"A dotted class name selects the whole class. METHOD uses Class#name or Class#name(parameters):returnType. An omitted signature is accepted only when it selects one method.
+        after_help = r#"A dotted class name or DEX class descriptor selects the whole class. A method target uses Class#name or Class#name(parameters):returnType. DEX/smali methods such as Lcom/example/Client;->send(I)V are also accepted. An omitted signature is accepted only when it selects one method.
 DEX_PC is the instruction offset from the method's insns array, measured in 16-bit code units. Embedded APKs are searched recursively. Use --dex to select an exact nested DEX location.
-With --mapping, METHOD may use original or obfuscated names. Text appends # pc=0x… to each executable instruction. JSON contains dex, class, original, and methods with numeric instruction dex_pc values. Class annotations and static field initializers are not emitted.
+With --mapping, the target may use original or obfuscated names; output uses actual APK symbols. Text appends # pc=0x… to each executable instruction. Use -o to write text or JSON to a file. JSON contains dex, class, and methods with numeric instruction dex_pc values. Class annotations and static field initializers are not emitted.
 
 Examples:
   apkq app.apk x 'com.example.MainActivity#onCreate(android.os.Bundle):void'
   apkq app.apk x com.example.Client
+  apkq app.apk x 'Lcom/example/Client;->send(I)V'
   apkq app.apk x 'com.example.Client#send'
   apkq app.apk x 'com.example.Client#send(int):void' --dex classes2.dex
   apkq app.apk --mapping mapping.txt --json x 'com.example.Client#send'"#
     )]
     Disassemble {
         /// Class or method: Class, Class#name, or Class#name(parameters):returnType
-        #[arg(value_parser = parse_disassemble_target)]
-        method: String,
-        /// Exact DEX location, such as classes2.dex or assets/plugin.apk!classes.dex
-        #[arg(long)]
-        dex: Option<String>,
+        #[arg(value_name = "TARGET", value_parser = Cli::parse_target)]
+        target: DisassembleTarget,
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        dex: DexArgs,
     },
     /// Find Android resources and references in compiled XML
     #[command(
@@ -120,6 +207,8 @@ Examples:
   apkq app.apk --json r --type layout --uses-resource 0x7f0a0012"#
     )]
     Resources {
+        #[command(flatten)]
+        table: TableArgs,
         /// List all resources
         #[arg(
             long,
@@ -129,29 +218,25 @@ Examples:
         /// Exact resource type, such as string, id, or layout
         #[arg(long = "type", value_parser = non_empty)]
         kind: Option<String>,
-        /// Exact resource entry name
-        #[arg(long, value_parser = non_empty, conflicts_with = "name_regex")]
-        name: Option<String>,
-        /// Rust regex matched against the resource name
-        #[arg(long)]
-        name_regex: Option<Regex>,
+        #[command(flatten)]
+        name: NameArgs,
         /// Numeric resource ID, decimal or 0x-prefixed hexadecimal
-        #[arg(long, value_parser = resource::parse_id)]
+        #[arg(long, value_parser = resource::Location::parse_id)]
         id: Option<u32>,
         /// Case-sensitive substring of decoded resource value
         #[arg(long, value_parser = non_empty, conflicts_with = "value_regex")]
         value: Option<String>,
         /// Regex for decoded resource value
-        #[arg(long, value_parser = non_empty)]
-        value_regex: Option<String>,
+        #[arg(long)]
+        value_regex: Option<Regex>,
         /// Referenced ID, type/name, or package:type/name
-        #[arg(long, value_parser = resource::validate_reference)]
+        #[arg(long, value_parser = resource::Query::validate_reference)]
         uses_resource: Option<String>,
     },
     /// Find class definitions
     #[command(
         visible_alias = "c",
-        after_help = r#"Use --list to list all classes. Use full dotted names, not DEX descriptors.
+        after_help = r#"Use --list to list all classes. Class inputs accept dotted Java names or DEX descriptors.
 --name is exact. --name-regex matches the full dotted class name using Rust regex syntax. They are alternatives.
 --inherits finds direct and transitive subclasses and implementors; the base class is excluded.
 Filters are ANDed. With --mapping, class filters also match original names.
@@ -164,6 +249,10 @@ Examples:
   apkq app.apk --mapping mapping.txt c --inherits com.example.ItemBase"#
     )]
     Classes {
+        #[command(flatten)]
+        table: TableArgs,
+        #[command(flatten)]
+        dex: DexArgs,
         /// List all classes
         #[arg(
             long,
@@ -171,19 +260,19 @@ Examples:
         )]
         list: bool,
         /// Exact class name
-        #[arg(long, conflicts_with = "name_regex")]
+        #[arg(long, conflicts_with = "name_regex", value_parser = Cli::parse_class)]
         name: Option<JavaClass>,
         /// Rust regex matched against the full dotted class name
         #[arg(long)]
         name_regex: Option<Regex>,
         /// Direct or transitive subclasses and implementors
-        #[arg(long)]
+        #[arg(long, value_parser = Cli::parse_class)]
         inherits: Option<JavaClass>,
     },
     /// Find field definitions
     #[command(
         visible_alias = "f",
-        after_help = r#"Use --list to list all fields. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax; the two name filters are alternatives. Filters are ANDed.
+        after_help = r#"Use --list to list all fields. --class accepts a dotted Java name or DEX descriptor; --name is exact; --name-regex uses Rust regex syntax; the two name filters are alternatives. Filters are ANDed.
 With --mapping, filters also match original class and field names.
 
 Examples:
@@ -193,6 +282,10 @@ Examples:
   apkq app.apk --mapping mapping.txt f --name originalField"#
     )]
     Fields {
+        #[command(flatten)]
+        table: TableArgs,
+        #[command(flatten)]
+        dex: DexArgs,
         /// List all fields
         #[arg(
             long,
@@ -200,24 +293,20 @@ Examples:
         )]
         list: bool,
         /// Exact declaring class name
-        #[arg(long)]
+        #[arg(long, value_parser = Cli::parse_class)]
         class: Option<JavaClass>,
-        /// Exact field name
-        #[arg(long, conflicts_with = "name_regex")]
-        name: Option<String>,
-        /// Rust regex matched against the field name
-        #[arg(long)]
-        name_regex: Option<Regex>,
+        #[command(flatten)]
+        name: NameArgs,
     },
     /// Find method definitions; repeated reference filters are ANDed within one method
     #[command(
         visible_alias = "m",
-        after_help = r#"Use --list to list all methods. --class takes a full dotted class name; --name is exact; --name-regex uses Rust regex syntax; the two name filters are alternatives. --has-field requires a field declared in that class.
+        after_help = r#"Use --list to list all methods. --class accepts a dotted Java name or DEX descriptor; --name is exact; --name-regex uses Rust regex syntax; the two name filters are alternatives. --has-field requires a field declared in that class.
 All filters are ANDed. Repeated reference options require references within the same method.
 --uses-string matches case-sensitive substrings, including reads of initialized static string fields.
 --calls Class#name matches any overload; add (parameters):returnType for an exact signature.
---uses-field Class#name matches any type; add :type to specify one.
-Types use Java syntax: int, java.lang.String[], etc.
+--uses-field Class#name matches any type; add :type to specify one. DEX/smali references such as Lcom/example/Client;->send(I)V and Lcom/example/Config;->key:Ljava/lang/String; are also accepted.
+Types accept Java syntax (int, java.lang.String[]) or DEX descriptors (I, [Ljava/lang/String;).
 With --mapping, class/member filters also match original names.
 Calls match explicit DEX invoke instructions.
 
@@ -228,12 +317,18 @@ Examples:
   apkq app.apk m --uses-string token --uses-string secret
   apkq app.apk m --calls 'com.example.Client#send'
   apkq app.apk m --calls 'com.example.Client#send(int):void'
+  apkq app.apk m --calls 'Lcom/example/Client;->send(I)V'
   apkq app.apk m --uses-field 'com.example.Config#key'
   apkq app.apk m --uses-field 'com.example.Config#key:java.lang.String'
+  apkq app.apk m --uses-field 'Lcom/example/Config;->key:Ljava/lang/String;'
   apkq app.apk m --uses-string token --uses-type java.lang.String
   apkq app.apk --mapping mapping.txt m --calls 'com.example.Client#send'"#
     )]
     Methods {
+        #[command(flatten)]
+        table: TableArgs,
+        #[command(flatten)]
+        dex: DexArgs,
         /// List all methods
         #[arg(
             long,
@@ -241,14 +336,10 @@ Examples:
         )]
         list: bool,
         /// Exact declaring class name
-        #[arg(long)]
+        #[arg(long, value_parser = Cli::parse_class)]
         class: Option<JavaClass>,
-        /// Exact method name
-        #[arg(long, conflicts_with = "name_regex")]
-        name: Option<String>,
-        /// Rust regex matched against the method name
-        #[arg(long)]
-        name_regex: Option<Regex>,
+        #[command(flatten)]
+        name: NameArgs,
         /// Keep methods declared in classes with a field of this name
         #[arg(long)]
         has_field: Option<String>,
@@ -256,30 +347,51 @@ Examples:
         #[arg(long = "uses-string", alias = "string", value_parser = non_empty)]
         strings: Vec<String>,
         /// Called method: Class#name or Class#name(parameters):returnType
-        #[arg(long = "calls")]
+        #[arg(long = "calls", value_parser = Cli::parse_method)]
         calls: Vec<JavaMethod>,
         /// Referenced type, such as java.lang.String
-        #[arg(long = "uses-type")]
+        #[arg(long = "uses-type", value_parser = Cli::parse_type)]
         types: Vec<JavaType>,
         /// Accessed field: Class#name or Class#name:type
-        #[arg(long = "uses-field")]
+        #[arg(long = "uses-field", value_parser = Cli::parse_field)]
         fields: Vec<JavaField>,
     },
 }
 
 impl Command {
+    fn aligned(&self) -> bool {
+        match self {
+            Self::Classes { table, .. }
+            | Self::Fields { table, .. }
+            | Self::Methods { table, .. }
+            | Self::Resources { table, .. } => table.aligned,
+            _ => false,
+        }
+    }
+
+    fn selected_dex(&self) -> Option<&str> {
+        match self {
+            Self::Classes { dex, .. }
+            | Self::Fields { dex, .. }
+            | Self::Methods { dex, .. }
+            | Self::Decompile { dex, .. }
+            | Self::Disassemble { dex, .. } => dex.dex.as_deref(),
+            _ => None,
+        }
+    }
+
     fn has_query(&self) -> bool {
         match self {
             Self::Decompile { .. } | Self::Disassemble { .. } => true,
             Self::Resources {
                 list,
                 kind,
-                name,
-                name_regex,
+                name: NameArgs { name, name_regex },
                 id,
                 value,
                 value_regex,
                 uses_resource,
+                ..
             } => {
                 *list
                     || kind.is_some()
@@ -295,23 +407,24 @@ impl Command {
                 name,
                 name_regex,
                 inherits,
+                ..
             } => *list || name.is_some() || name_regex.is_some() || inherits.is_some(),
             Self::Fields {
                 list,
                 class,
-                name,
-                name_regex,
+                name: NameArgs { name, name_regex },
+                ..
             } => *list || class.is_some() || name.is_some() || name_regex.is_some(),
             Self::Methods {
                 list,
                 class,
-                name,
-                name_regex,
+                name: NameArgs { name, name_regex },
                 has_field,
                 strings,
                 calls,
                 types,
                 fields,
+                ..
             } => {
                 *list
                     || class.is_some()
@@ -341,6 +454,10 @@ impl Command {
 pub(super) fn main() {
     let cli = Cli::parse();
 
+    if let Err(error) = cli.validate() {
+        error.exit();
+    }
+
     if !cli.command.has_query() {
         let error = Cli::command()
             .try_get_matches_from(["apkq", "input.apk", cli.command.name(), "--help"])
@@ -350,557 +467,203 @@ pub(super) fn main() {
         return;
     }
 
-    if let Err(error) = run(cli) {
+    if let Err(error) = cli.run() {
         eprintln!("error: {error}");
         process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
-    if let Command::Disassemble {
-        method: query,
-        dex: selected_dex,
-    } = &cli.command
-    {
-        let started = Instant::now();
-        let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
-        let index = dex::index_apk(&cli.input, None)?;
-        if !query.contains('#') {
-            let class: JavaClass = query.parse()?;
-            let matches = index
-                .classes
-                .iter()
-                .filter(|item| {
-                    selected_dex
-                        .as_deref()
-                        .is_none_or(|selected| item.dex == selected)
-                        && class_matches(&item.class, &class, mapping.as_ref())
-                })
-                .collect::<Vec<_>>();
-            let item = match matches.as_slice() {
-                [] => return Err(format!("class {class} was not found")),
-                [item] => *item,
-                items => {
-                    return Err(format!(
-                        "class {class} is ambiguous:\n{}\nselect one with --dex",
-                        items
-                            .iter()
-                            .map(|item| format!("  {}", item.dex))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ));
-                }
-            };
-            let result =
-                dex::disassemble_apk(&cli.input, &item.dex, &item.class, None, mapping.as_ref())?;
-            let actual = JavaClass::from_descriptor(&item.class)?.to_string();
-            let original = mapping
-                .as_ref()
-                .and_then(|mapping| mapping.original_class(&item.class))
-                .map(JavaClass::from_descriptor)
-                .transpose()?
-                .map(|class| class.to_string());
+impl Cli {
+    fn run(self) -> Result<(), String> {
+        if let Command::Disassemble {
+            target,
+            dex,
+            output,
+        } = &self.command
+        {
+            let started = Instant::now();
+            let mapping = self.mapping.as_deref().map(mapping::load).transpose()?;
+            let prepared = ApkArchive::open(&self.input)?;
+            let (dex, descriptor, result) = Disassembly::from_apk(
+                &prepared,
+                target,
+                dex.dex.as_deref(),
+                mapping.as_ref(),
+                if self.json {
+                    DisassemblyFormat::Instructions
+                } else {
+                    DisassemblyFormat::Smali
+                },
+            )?;
 
-            print_disassembled(&item.dex, &actual, original.as_deref(), &result, cli.json)?;
+            let class = JavaClass::from_descriptor(&descriptor)?.to_string();
+
+            Output::print_disassembled(&dex, &class, &result, output.output.as_deref())?;
             eprintln!("disassembled in {:.3}s", started.elapsed().as_secs_f64());
 
             return Ok(());
         }
 
-        let query: JavaMethod = query.parse()?;
-        let matches = index
-            .locations
-            .iter()
-            .filter(|method| {
-                selected_dex
-                    .as_deref()
-                    .is_none_or(|selected| method.dex == selected)
-                    && dex::method_matches(
-                        &query,
-                        &method.class,
-                        &method.method,
-                        &method.descriptor,
-                        mapping.as_ref(),
-                    )
-            })
-            .collect::<Vec<_>>();
-        let method = match matches.as_slice() {
-            [] if selected_dex.is_some() => {
-                return Err(format!(
-                    "method {query} was not found in DEX {}",
-                    selected_dex.as_deref().unwrap_or_default()
-                ));
-            }
-            [] => return Err(format!("method {query} was not found")),
-            [method] => *method,
-            matches => {
-                let locations = matches
-                    .iter()
-                    .map(|method| {
-                        JavaMethod::from_descriptor(
-                            &method.class,
-                            &method.method,
-                            &method.descriptor,
-                        )
-                        .map(|symbol| format!("  {}  {symbol}", method.dex))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join("\n");
+        if let Command::Decompile { class, dex, output } = &self.command {
+            let started = Instant::now();
+            let mapping = self.mapping.as_deref().map(mapping::load).transpose()?;
+            let prepared = ApkArchive::open(&self.input)?;
+            let result =
+                DecompiledClass::from_apk(&prepared, class, dex.dex.as_deref(), mapping.as_ref())?;
+            let actual = JavaClass::from_descriptor(&result.descriptor)?.to_string();
 
-                return Err(format!(
-                    "method {query} is ambiguous:\n{locations}\nuse a full signature or select one with --dex"
-                ));
-            }
-        };
+            Output::print_decompiled(
+                &result.dex,
+                &actual,
+                &result.source,
+                self.json,
+                output.output.as_deref(),
+            )?;
+            eprintln!("decompiled in {:.3}s", started.elapsed().as_secs_f64());
 
-        let result = dex::disassemble_apk(
-            &cli.input,
-            &method.dex,
-            &method.class,
-            Some((&method.method, &method.descriptor)),
-            mapping.as_ref(),
-        )?;
-        let actual = JavaClass::from_descriptor(&method.class)?.to_string();
-        let original = mapping
-            .as_ref()
-            .and_then(|mapping| mapping.original_class(&method.class))
-            .map(JavaClass::from_descriptor)
-            .transpose()?
-            .map(|class| class.to_string());
-
-        print_disassembled(&method.dex, &actual, original.as_deref(), &result, cli.json)?;
-        eprintln!("disassembled in {:.3}s", started.elapsed().as_secs_f64());
-
-        return Ok(());
-    }
-
-    if let Command::Decompile {
-        class,
-        dex: selected_dex,
-        output,
-    } = &cli.command
-    {
-        let started = Instant::now();
-        let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
-        let mut descriptors = vec![class.descriptor()];
-
-        if let Some(mapping) = &mapping {
-            descriptors.extend(mapping.obfuscated_classes(class.descriptor()));
+            return Ok(());
         }
 
-        descriptors.sort_unstable();
-        descriptors.dedup();
-
-        let matches = dex::decompile_apk(&cli.input, &descriptors, selected_dex.as_deref())?;
-        let result = match matches.as_slice() {
-            [] => return Err(format!("class {class} was not found")),
-            [result] => result,
-            matches => {
-                let locations = matches
-                    .iter()
-                    .map(|result| format!("  {}", result.dex))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                return Err(format!(
-                    "class {class} is ambiguous:\n{locations}\nselect one with --dex"
-                ));
-            }
-        };
-
-        let actual = JavaClass::from_descriptor(&result.descriptor)?.to_string();
-        let original = mapping
-            .as_ref()
-            .and_then(|mapping| mapping.original_class(&result.descriptor))
-            .map(JavaClass::from_descriptor)
-            .transpose()?
-            .map(|class| class.to_string());
-
-        output::print_decompiled(
-            &result.dex,
-            &actual,
-            original.as_deref(),
-            &result.source,
-            cli.json,
-            output.as_deref(),
-        )?;
-
-        eprintln!("decompiled in {:.3}s", started.elapsed().as_secs_f64());
-
-        return Ok(());
-    }
-
-    if let Command::Resources {
-        kind,
-        name,
-        name_regex,
-        id,
-        value,
-        value_regex,
-        uses_resource,
-        ..
-    } = &cli.command
-    {
-        let mapping = cli
-            .mapping
-            .as_deref()
-            .map(resource::mapping::load)
-            .transpose()?;
-
-        return run_resources(
-            &cli.input,
-            Query {
-                mapping: mapping.as_ref(),
-                kind: kind.as_deref(),
-                name: name.as_deref(),
-                name_regex: name_regex.as_ref(),
-                id: *id,
-                value: value.as_deref(),
-                value_regex: value_regex
-                    .as_deref()
-                    .map(Regex::new)
-                    .transpose()
-                    .map_err(|error| error.to_string())?
-                    .as_ref(),
-                uses_resource: uses_resource.as_deref(),
-            },
-            cli.json,
-            cli.aligned,
-        );
-    }
-
-    let apk = &cli.input;
-    let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
-    let mut output = Vec::new();
-    let started = Instant::now();
-
-    let filter = match &cli.command {
-        Command::Methods {
-            strings,
-            calls,
-            types,
-            fields,
+        if let Command::Resources {
+            kind,
+            name: NameArgs { name, name_regex },
+            id,
+            value,
+            value_regex,
+            uses_resource,
             ..
-        } if !strings.is_empty()
-            || !calls.is_empty()
-            || !types.is_empty()
-            || !fields.is_empty() =>
+        } = &self.command
         {
-            Some(ReferenceFilter {
+            let mapping = self
+                .mapping
+                .as_deref()
+                .map(resource::mapping::load)
+                .transpose()?;
+
+            return Self::run_resources(
+                &self.input,
+                Query {
+                    mapping: mapping.as_ref(),
+                    kind: kind.as_deref(),
+                    name: name.as_deref(),
+                    name_regex: name_regex.as_ref(),
+                    id: *id,
+                    value: value.as_deref(),
+                    value_regex: value_regex.as_ref(),
+                    uses_resource: uses_resource.as_deref(),
+                },
+                self.json,
+                self.command.aligned(),
+            );
+        }
+
+        let apk = &self.input;
+        let mapping = self.mapping.as_deref().map(mapping::load).transpose()?;
+        let started = Instant::now();
+
+        let filter = match &self.command {
+            Command::Methods {
                 strings,
                 calls,
                 types,
                 fields,
-                mapping: mapping.as_ref(),
-            })
-        }
-        _ => None,
-    };
-    let index = dex::index_apk(apk, filter.as_ref())?;
-
-    match &cli.command {
-        Command::Classes {
-            name,
-            name_regex,
-            inherits,
-            ..
-        } => {
-            let descendants = inherits
-                .as_ref()
-                .map(|parent| inheritors(&index, parent, mapping.as_ref()));
-
-            for class in &index.classes {
-                if !class_filters_match(
-                    &class.class,
-                    name.as_ref(),
-                    name_regex.as_ref(),
-                    mapping.as_ref(),
-                )? || descendants
-                    .as_ref()
-                    .is_some_and(|descendants| !descendants.contains(class.class.as_str()))
-                {
-                    continue;
-                }
-
-                output.push(Row {
-                    dex: class.dex.clone(),
-                    kind: 'C',
-                    symbol: JavaClass::from_descriptor(&class.class)?.to_string(),
-                    original: mapping
-                        .as_ref()
-                        .and_then(|mapping| mapping.original_class(&class.class))
-                        .map(JavaClass::from_descriptor)
-                        .transpose()?
-                        .map(|class| class.to_string()),
-                    source: class.source_file.clone(),
-                });
+                ..
+            } if !strings.is_empty()
+                || !calls.is_empty()
+                || !types.is_empty()
+                || !fields.is_empty() =>
+            {
+                Some(ReferenceFilter {
+                    strings,
+                    calls,
+                    types,
+                    fields,
+                    mapping: mapping.as_ref(),
+                })
             }
-        }
-        Command::Fields {
-            class,
-            name,
-            name_regex,
-            ..
-        } => {
-            for field in &index.fields {
-                if class
-                    .as_ref()
-                    .is_some_and(|class| !class_matches(&field.class, class, mapping.as_ref()))
-                    || name
-                        .as_deref()
-                        .is_some_and(|name| !field_name_matches(field, name, mapping.as_ref()))
-                    || name_regex.as_ref().is_some_and(|regex| {
-                        !field_name_regex_matches(field, regex, mapping.as_ref())
-                    })
-                {
-                    continue;
-                }
+            _ => None,
+        };
 
-                let symbol =
-                    JavaField::from_descriptor(&field.class, &field.field, &field.descriptor)?
-                        .to_string();
-                let originals = mapping
-                    .as_ref()
-                    .map(|mapping| {
-                        mapping
-                            .fields(&field.class, &field.field, &field.descriptor)
-                            .filter_map(|alias| {
-                                mapping.original_class(&field.class).map(|owner| {
-                                    JavaField::from_descriptor(owner, alias.name, alias.descriptor)
-                                        .map(|field| field.to_string())
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
+        let prepared = ApkArchive::open(apk)?;
+        let index_dex = match &self.command {
+            Command::Classes {
+                inherits: Some(_), ..
+            } => None,
+            _ => self.command.selected_dex(),
+        };
 
-                push_aliases(
-                    &mut output,
-                    &field.dex,
-                    'F',
-                    symbol,
-                    originals,
-                    field.source_file.as_deref(),
-                );
-            }
-        }
-        Command::Methods {
-            class,
-            name,
-            name_regex,
-            has_field,
-            ..
-        } => {
-            let field_classes = has_field.as_deref().map(|name| {
-                index
-                    .fields
-                    .iter()
-                    .filter(|field| field_name_matches(field, name, mapping.as_ref()))
-                    .map(|field| field.class.as_str())
-                    .collect::<HashSet<_>>()
-            });
+        let index = DexIndex::from_archive(&prepared, filter.as_ref(), index_dex)?;
 
-            for method in &index.locations {
-                if class
-                    .as_ref()
-                    .is_some_and(|class| !class_matches(&method.class, class, mapping.as_ref()))
-                    || name
-                        .as_deref()
-                        .is_some_and(|name| !method_name_matches(method, name, mapping.as_ref()))
-                    || name_regex.as_ref().is_some_and(|regex| {
-                        !method_name_regex_matches(method, regex, mapping.as_ref())
-                    })
-                    || field_classes
-                        .as_ref()
-                        .is_some_and(|classes| !classes.contains(method.class.as_str()))
-                {
-                    continue;
-                }
+        let query = match &self.command {
+            Command::Classes {
+                name,
+                name_regex,
+                inherits,
+                ..
+            } => dex::query::Query::Classes {
+                name: name.as_ref(),
+                name_regex: name_regex.as_ref(),
+                inherits: inherits.as_ref(),
+            },
+            Command::Fields { class, name, .. } => dex::query::Query::Fields {
+                class: class.as_ref(),
+                name: name.name.as_deref(),
+                name_regex: name.name_regex.as_ref(),
+            },
+            Command::Methods {
+                class,
+                name,
+                has_field,
+                ..
+            } => dex::query::Query::Methods {
+                class: class.as_ref(),
+                name: name.name.as_deref(),
+                name_regex: name.name_regex.as_ref(),
+                has_field: has_field.as_deref(),
+            },
+            _ => unreachable!(),
+        };
 
-                let symbol =
-                    JavaMethod::from_descriptor(&method.class, &method.method, &method.descriptor)?
-                        .to_string();
-                let originals = mapping
-                    .as_ref()
-                    .map(|mapping| {
-                        mapping
-                            .methods(&method.class, &method.method, &method.descriptor)
-                            .filter_map(|alias| {
-                                mapping.original_class(&method.class).map(|owner| {
-                                    JavaMethod::from_descriptor(owner, alias.name, alias.descriptor)
-                                        .map(|method| method.to_string())
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
+        let output = query.select(&index, mapping.as_ref(), self.command.selected_dex())?;
 
-                push_aliases(
-                    &mut output,
-                    &method.dex,
-                    'M',
-                    symbol,
-                    originals,
-                    method.source_file.as_deref(),
-                );
-            }
-        }
-        Command::Resources { .. } | Command::Decompile { .. } | Command::Disassemble { .. } => {
-            unreachable!()
-        }
+        Output::print_output(
+            &output,
+            self.json,
+            self.command.aligned(),
+            self.mapping.is_some(),
+        )?;
+
+        eprintln!(
+            "searched in {:.3}s; {} match(es)",
+            started.elapsed().as_secs_f64(),
+            output.len()
+        );
+
+        Ok(())
     }
 
-    output.sort();
-    output.dedup();
+    fn run_resources(
+        input: &Path,
+        query: Query<'_>,
+        json: bool,
+        aligned: bool,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        let show_original = query.mapping.is_some();
+        let mut rows = query.index_apk(input)?;
 
-    print_output(&output, cli.json, cli.aligned, cli.mapping.is_some())?;
+        rows.sort();
+        rows.dedup();
+        Output::print_resources(&rows, json, aligned, show_original)?;
 
-    eprintln!(
-        "searched in {:.3}s; {} match(es)",
-        started.elapsed().as_secs_f64(),
-        output.len()
-    );
+        eprintln!(
+            "searched in {:.3}s; {} match(es)",
+            started.elapsed().as_secs_f64(),
+            rows.len()
+        );
 
-    Ok(())
-}
-
-fn run_resources(input: &Path, query: Query<'_>, json: bool, aligned: bool) -> Result<(), String> {
-    let started = Instant::now();
-    let show_original = query.mapping.is_some();
-    let mut rows = resource::index_apk(input, &query)?;
-
-    rows.sort();
-    rows.dedup();
-    print_resources(&rows, json, aligned, show_original)?;
-
-    eprintln!(
-        "searched in {:.3}s; {} match(es)",
-        started.elapsed().as_secs_f64(),
-        rows.len()
-    );
-    Ok(())
-}
-
-fn class_matches(descriptor: &str, query: &JavaClass, mapping: Option<&Mapping>) -> bool {
-    descriptor == query.descriptor()
-        || mapping
-            .and_then(|mapping| mapping.original_class(descriptor))
-            .is_some_and(|name| name == query.descriptor())
-}
-
-fn class_filters_match(
-    descriptor: &str,
-    name: Option<&JavaClass>,
-    name_regex: Option<&Regex>,
-    mapping: Option<&Mapping>,
-) -> Result<bool, String> {
-    let original = mapping.and_then(|mapping| mapping.original_class(descriptor));
-    let names = [Some(descriptor), original];
-
-    if !name.is_none_or(|query| {
-        names
-            .iter()
-            .flatten()
-            .any(|name| *name == query.descriptor())
-    }) {
-        return Ok(false);
+        Ok(())
     }
-
-    let Some(regex) = name_regex else {
-        return Ok(true);
-    };
-
-    for descriptor in names.iter().flatten() {
-        if regex.is_match(JavaClass::from_descriptor(descriptor)?.name()) {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn method_name_matches(
-    method: &dex::MethodLocation,
-    query: &str,
-    mapping: Option<&Mapping>,
-) -> bool {
-    method.method == query
-        || mapping.is_some_and(|mapping| {
-            mapping
-                .methods(&method.class, &method.method, &method.descriptor)
-                .any(|alias| alias.name == query)
-        })
-}
-
-fn method_name_regex_matches(
-    method: &dex::MethodLocation,
-    regex: &Regex,
-    mapping: Option<&Mapping>,
-) -> bool {
-    regex.is_match(&method.method)
-        || mapping.is_some_and(|mapping| {
-            mapping
-                .methods(&method.class, &method.method, &method.descriptor)
-                .any(|alias| regex.is_match(alias.name))
-        })
-}
-
-fn field_name_matches(field: &dex::FieldLocation, query: &str, mapping: Option<&Mapping>) -> bool {
-    field.field == query
-        || mapping.is_some_and(|mapping| {
-            mapping
-                .fields(&field.class, &field.field, &field.descriptor)
-                .any(|alias| alias.name == query)
-        })
-}
-
-fn field_name_regex_matches(
-    field: &dex::FieldLocation,
-    regex: &Regex,
-    mapping: Option<&Mapping>,
-) -> bool {
-    regex.is_match(&field.field)
-        || mapping.is_some_and(|mapping| {
-            mapping
-                .fields(&field.class, &field.field, &field.descriptor)
-                .any(|alias| regex.is_match(alias.name))
-        })
-}
-
-fn inheritors<'a>(
-    index: &'a DexIndex,
-    query: &JavaClass,
-    mapping: Option<&Mapping>,
-) -> HashSet<&'a str> {
-    let mut children = HashMap::<&str, Vec<&str>>::new();
-
-    for class in &index.classes {
-        if let Some(parent) = class.superclass.as_deref() {
-            children.entry(parent).or_default().push(&class.class);
-        }
-        for parent in &class.interfaces {
-            children.entry(parent).or_default().push(&class.class);
-        }
-    }
-
-    let mut pending = children
-        .keys()
-        .filter(|name| class_matches(name, query, mapping))
-        .copied()
-        .collect::<VecDeque<_>>();
-    let mut matches = HashSet::new();
-
-    while let Some(parent) = pending.pop_front() {
-        for &child in children.get(parent).into_iter().flatten() {
-            if matches.insert(child) {
-                pending.push_back(child);
-            }
-        }
-    }
-
-    matches
 }
 
 fn non_empty(value: &str) -> Result<String, String> {
@@ -911,34 +674,101 @@ fn non_empty(value: &str) -> Result<String, String> {
     }
 }
 
-fn parse_disassemble_target(value: &str) -> Result<String, String> {
-    if value.contains('#') {
-        value.parse::<JavaMethod>()?;
-    } else {
-        value.parse::<JavaClass>()?;
-    }
-
-    Ok(value.to_owned())
-}
-
-fn parse_decompile_class(value: &str) -> Result<JavaClass, String> {
-    if value.starts_with('L') && value.ends_with(';') {
-        JavaClass::from_descriptor(value)
-    } else {
-        value.parse()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use apkq::dex::mapping::Mapping;
-    use apkq::dex::{FieldLocation, MethodLocation};
     use clap::Parser;
-    use regex::Regex;
 
-    use super::{
-        Cli, Command, class_filters_match, field_name_regex_matches, method_name_regex_matches,
-    };
+    use super::{Cli, Command};
+
+    #[test]
+    fn dispatches_format_before_parsing_nested_types() {
+        let java = Cli::parse_method("Owner#call(I):void").unwrap();
+        assert!(java.matches("LOwner;", "call", "(LI;)V"));
+        let descriptor = Cli::parse_method("LOwner;->call(I)V").unwrap();
+        assert!(descriptor.matches("LOwner;", "call", "(I)V"));
+        let field = Cli::parse_field("Owner#value:V").unwrap();
+        assert!(field.matches("LOwner;", "value", "LV;"));
+    }
+
+    #[test]
+    fn accepts_smali_targets_and_reference_filters() {
+        for arguments in [
+            vec!["apkq", "app.apk", "x", "Lcom/example/Client;->send(I)V"],
+            vec!["apkq", "app.apk", "x", "Lcom/example/Client;->send"],
+            vec![
+                "apkq",
+                "app.apk",
+                "m",
+                "--calls",
+                "Lcom/example/Client;->send(I)V",
+                "--uses-field",
+                "Lcom/example/Config;->key:Ljava/lang/String;",
+                "--uses-type",
+                "[Ljava/lang/String;",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+    }
+
+    #[test]
+    fn scopes_shared_options_to_supported_commands() {
+        for command in ["c", "m", "f", "r"] {
+            assert!(
+                Cli::try_parse_from(["apkq", "app.apk", command, "--aligned", "--list"]).is_ok()
+            );
+            for arguments in [
+                vec!["apkq", "app.apk", "--json", command, "--aligned", "--list"],
+                vec!["apkq", "app.apk", command, "--aligned", "--list", "--json"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(arguments)
+                        .and_then(|cli| cli.validate())
+                        .is_err()
+                );
+            }
+        }
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "--aligned", "c", "--list"]).is_err());
+        for command in ["c", "m", "f"] {
+            assert!(
+                Cli::try_parse_from([
+                    "apkq",
+                    "app.apk",
+                    command,
+                    "--dex",
+                    "classes2.dex",
+                    "--list"
+                ])
+                .is_ok()
+            );
+        }
+        for command in ["d", "x"] {
+            assert!(
+                Cli::try_parse_from([
+                    "apkq",
+                    "app.apk",
+                    command,
+                    "Lcom/example/Client;",
+                    "--dex",
+                    "classes2.dex",
+                    "-o",
+                    "result.txt"
+                ])
+                .is_ok()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "apkq",
+                    "app.apk",
+                    command,
+                    "com.example.Client",
+                    "--aligned"
+                ])
+                .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "r", "--value-regex", "["]).is_err());
+    }
 
     #[test]
     fn accepts_short_command_aliases_and_combined_filters() {
@@ -1036,7 +866,7 @@ mod tests {
             Cli::try_parse_from(["apkq", "app.apk", "m", "--calls", "com.example.Client#send"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["apkq", "app.apk", "c", "--inherits", "LBase;"]).is_err());
+        assert!(Cli::try_parse_from(["apkq", "app.apk", "c", "--inherits", "LBase;"]).is_ok());
         assert!(matches!(
             Cli::try_parse_from([
                 "apkq",
@@ -1154,66 +984,5 @@ mod tests {
             ])
             .is_err()
         );
-    }
-
-    #[test]
-    fn matches_class_regex_against_java_names() {
-        let package = Regex::new(r"^com\.example\.").unwrap();
-        let simple_name = Regex::new(r"MainActivity$").unwrap();
-
-        assert!(
-            class_filters_match("Lcom/example/MainActivity;", None, Some(&package), None).unwrap()
-        );
-        assert!(
-            class_filters_match("Lcom/example/MainActivity;", None, Some(&simple_name), None)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn matches_member_regex_against_original_names() {
-        let mapping = Mapping::parse(
-            "com.example.Type -> a.b:\n    int originalField -> c\n    void originalMethod() -> d\n",
-        )
-        .unwrap();
-        let field = FieldLocation {
-            dex: String::new(),
-            class: "La/b;".to_owned(),
-            field: "c".to_owned(),
-            descriptor: "I".to_owned(),
-            source_file: None,
-        };
-        let method = MethodLocation {
-            dex: String::new(),
-            class: "La/b;".to_owned(),
-            method: "d".to_owned(),
-            descriptor: "()V".to_owned(),
-            source_file: None,
-        };
-
-        assert!(field_name_regex_matches(
-            &field,
-            &Regex::new("^originalField$").unwrap(),
-            Some(&mapping)
-        ));
-        assert!(method_name_regex_matches(
-            &method,
-            &Regex::new("^originalMethod$").unwrap(),
-            Some(&mapping)
-        ));
-        assert!(apkq::dex::method_matches(
-            &"com.example.Type#originalMethod():void".parse().unwrap(),
-            &method.class,
-            &method.method,
-            &method.descriptor,
-            Some(&mapping)
-        ));
-        assert!(apkq::dex::method_matches(
-            &"a.b#d():void".parse().unwrap(),
-            &method.class,
-            &method.method,
-            &method.descriptor,
-            Some(&mapping)
-        ));
     }
 }

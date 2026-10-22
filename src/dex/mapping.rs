@@ -1,13 +1,11 @@
 use std::collections::HashMap;
-#[cfg(test)]
-use std::io::{Cursor, Read};
+use std::slice::Iter;
 
 use rkyv::rancor::Error;
 use rkyv::{Archive, Serialize};
 
+use crate::java::JavaType;
 use crate::mapping_cache::{self, Cache};
-#[cfg(test)]
-use zip::ZipArchive;
 
 #[derive(Debug)]
 pub struct Mapping {
@@ -40,8 +38,8 @@ pub struct MemberMapping<'a> {
 pub struct MemberMappings<'a>(MemberMappingIter<'a>);
 
 enum MemberMappingIter<'a> {
-    Parsed(std::slice::Iter<'a, StoredMemberMapping>),
-    Archived(std::slice::Iter<'a, ArchivedStoredMemberMapping>),
+    Parsed(Iter<'a, StoredMemberMapping>),
+    Archived(Iter<'a, ArchivedStoredMemberMapping>),
     Empty,
 }
 
@@ -89,6 +87,7 @@ impl Mapping {
 
             if let Some((original, obfuscated)) = parse_class_line(line) {
                 let descriptor = type_descriptor(obfuscated, None)?;
+
                 classes.insert(
                     descriptor.clone(),
                     ClassMapping {
@@ -98,6 +97,7 @@ impl Mapping {
                     },
                 );
                 current_class = Some(descriptor);
+
                 continue;
             }
 
@@ -108,6 +108,7 @@ impl Mapping {
             let class = current_class.as_ref().ok_or_else(|| {
                 format!("member before class mapping at line {}", line_number + 1)
             })?;
+
             let class = classes
                 .get_mut(class)
                 .expect("current mapping class was just inserted");
@@ -223,29 +224,6 @@ fn archived(bytes: &[u8]) -> &ArchivedMappingData {
     unsafe { rkyv::access_unchecked(bytes) }
 }
 
-#[cfg(test)]
-fn read_zip_entry(bytes: &[u8], archive: &str, entry: &str) -> Result<Vec<u8>, String> {
-    let mut zip = ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| format!("invalid mapping ZIP {archive}: {error}"))?;
-    let mut file = zip
-        .by_name(entry)
-        .map_err(|error| format!("{archive}!{entry}: {error}"))?;
-
-    let mut output = Vec::new();
-
-    file.read_to_end(&mut output)
-        .map_err(|error| format!("{archive}!{entry}: {error}"))?;
-
-    if output.starts_with(b"PK\x03\x04")
-        || output.starts_with(b"PK\x05\x06")
-        || output.starts_with(b"PK\x07\x08")
-    {
-        return Err("nested mapping archives are not supported".to_owned());
-    }
-
-    Ok(output)
-}
-
 fn parse_class_line(line: &str) -> Option<(&str, &str)> {
     if line.starts_with(char::is_whitespace) {
         return None;
@@ -349,35 +327,13 @@ fn type_descriptor(
     type_name: &str,
     names: Option<&HashMap<String, String>>,
 ) -> Result<String, String> {
-    let mut type_name = type_name.trim();
-    let mut dimensions = 0;
-
-    while let Some(element) = type_name.strip_suffix("[]") {
-        type_name = element;
-        dimensions += 1;
-    }
-
-    let base = match type_name {
-        "void" => "V".to_owned(),
-        "boolean" => "Z".to_owned(),
-        "byte" => "B".to_owned(),
-        "char" => "C".to_owned(),
-        "short" => "S".to_owned(),
-        "int" => "I".to_owned(),
-        "long" => "J".to_owned(),
-        "float" => "F".to_owned(),
-        "double" => "D".to_owned(),
-        "" => return Err("empty type in mapping".to_owned()),
-        class => {
-            let class = names
-                .and_then(|names| names.get(class))
-                .map(String::as_str)
-                .unwrap_or(class);
-            format!("L{};", class.replace('.', "/"))
-        }
+    let ty: JavaType = type_name.trim().parse()?;
+    let ty = match names {
+        Some(names) => ty.map_class(names)?,
+        None => ty,
     };
 
-    Ok(format!("{}{}", "[".repeat(dimensions), base))
+    Ok(ty.descriptor().to_owned())
 }
 
 fn member_key(name: &str, descriptor: &str) -> String {
@@ -386,12 +342,8 @@ fn member_key(name: &str, descriptor: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write};
 
-    use zip::ZipWriter;
-    use zip::write::SimpleFileOptions;
-
-    use super::{Mapping, read_zip_entry};
+    use super::Mapping;
 
     const SAMPLE: &str = "\
 # compiler: R8
@@ -425,27 +377,6 @@ com.example.Model -> c.d:
         assert_eq!(
             method.descriptor,
             "(Lcom/example/Model;[I)Ljava/lang/String;"
-        );
-    }
-
-    #[test]
-    fn reads_an_explicit_zip_entry() {
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer
-            .start_file("maps/release.txt", SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(SAMPLE.as_bytes()).unwrap();
-        writer
-            .start_file("maps/nested.zip", SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(b"PK\x03\x04").unwrap();
-        let bytes = writer.finish().unwrap().into_inner();
-
-        let mapping = read_zip_entry(&bytes, "bundle.zip", "maps/release.txt").unwrap();
-        assert_eq!(mapping, SAMPLE.as_bytes());
-        assert_eq!(
-            read_zip_entry(&bytes, "bundle.zip", "maps/nested.zip").unwrap_err(),
-            "nested mapping archives are not supported"
         );
     }
 }

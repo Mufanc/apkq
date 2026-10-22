@@ -1,318 +1,273 @@
 use std::fs;
 use std::path::Path;
 
-use apkq::dex::DisassembledClass;
+use apkq::dex::Disassembly;
+use apkq::dex::query::Symbol;
 use apkq::resource::Location;
 use serde_json::json;
 
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct Row {
-    pub(super) dex: String,
-    pub(super) kind: char,
-    pub(super) symbol: String,
-    pub(super) original: Option<String>,
-    pub(super) source: Option<String>,
-}
+pub(super) struct Output;
 
-pub(super) fn print_disassembled(
-    dex: &str,
-    class: &str,
-    original: Option<&str>,
-    result: &DisassembledClass,
-    json_output: bool,
-) -> Result<(), String> {
-    if json_output {
-        let methods = result.methods.iter().map(|method| {
-            let instructions = method.instructions.iter().map(|instruction| json!({
-                "dex_pc": instruction.dex_pc,
-                "instruction": instruction.instruction,
-            })).collect::<Vec<_>>();
-            json!({"method": method.method, "original": method.original, "instructions": instructions})
-        }).collect::<Vec<_>>();
-
-        println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"dex": dex, "class": class, "original": original, "methods": methods})
-            )
-            .map_err(|error| error.to_string())?
-        );
-
-        return Ok(());
-    }
-
-    println!("# dex: {dex}");
-
-    if let Some(original) = original {
-        println!("# original: {original}");
-    }
-
-    println!("\n{}", result.smali.trim_matches('\n'));
-
-    Ok(())
-}
-
-pub(super) fn print_decompiled(
-    dex: &str,
-    class: &str,
-    original: Option<&str>,
-    source: &str,
-    json_output: bool,
-    output: Option<&Path>,
-) -> Result<(), String> {
-    if json_output {
-        let mut rendered = serde_json::to_string(&json!({
-            "dex": dex,
-            "class": class,
-            "original": original,
-            "source": source,
-        }))
-        .map_err(|error| error.to_string())?;
-
-        rendered.push('\n');
-
-        return write_output(&rendered, output);
-    }
-
-    if let Some(path) = output {
-        let mut source = source.to_owned();
-
-        if !source.ends_with('\n') {
-            source.push('\n');
-        }
-
-        return fs::write(path, source).map_err(|error| format!("{}: {error}", path.display()));
-    }
-
-    println!("{}\n", source.trim_matches('\n'));
-
-    Ok(())
-}
-
-fn write_output(output: &str, path: Option<&Path>) -> Result<(), String> {
-    if let Some(path) = path {
-        return fs::write(path, output).map_err(|error| format!("{}: {error}", path.display()));
-    }
-
-    print!("{output}");
-
-    Ok(())
-}
-
-pub(super) fn print_output(
-    output: &[Row],
-    json: bool,
-    aligned: bool,
-    show_original: bool,
-) -> Result<(), String> {
-    if json {
-        let values = output
-            .iter()
-            .map(|row| {
-                json!({
-                    "dex": row.dex, "type": row.kind.to_string(),
-                    "symbol": row.symbol, "original": row.original, "source": row.source,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        println!(
-            "{}",
-            serde_json::to_string(&values).map_err(|error| error.to_string())?
-        );
-    } else if aligned {
-        print_aligned(output, show_original);
-    } else {
-        let heading = if show_original {
-            "DEX\tTYPE\tSYMBOL\tORIGINAL\tSOURCE"
-        } else {
-            "DEX\tTYPE\tSYMBOL\tSOURCE"
-        };
-        println!("{heading}");
-
-        for row in output {
-            let mut fields = vec![tsv(&row.dex), row.kind.to_string(), tsv(&row.symbol)];
-            if show_original {
-                fields.push(tsv(row.original.as_deref().unwrap_or("-")));
-            }
-            fields.push(tsv(row.source.as_deref().unwrap_or("-")));
-            println!("{}", fields.join("\t"));
-        }
-    }
-
-    Ok(())
-}
-
-fn print_aligned(output: &[Row], show_original: bool) {
-    let dex_width = output
-        .iter()
-        .map(|row| row.dex.chars().count())
-        .max()
-        .unwrap_or(3)
-        .max(3);
-    let symbol_width = output
-        .iter()
-        .map(|row| row.symbol.chars().count())
-        .max()
-        .unwrap_or(6)
-        .max(6);
-
-    let original_heading = if show_original { "  ORIGINAL" } else { "" };
-    println!(
-        "{:<dex_width$}  TYPE  {:<symbol_width$}{original_heading}  SOURCE",
-        "DEX", "SYMBOL"
-    );
-
-    for row in output {
-        let original = if show_original {
-            format!("  {}", row.original.as_deref().unwrap_or("-"))
-        } else {
-            String::new()
-        };
-        println!(
-            "{:<dex_width$}  {:<4}  {:<symbol_width$}{}  {}",
-            row.dex,
-            row.kind,
-            row.symbol,
-            original,
-            row.source.as_deref().unwrap_or("-")
-        );
-    }
-}
-
-pub(super) fn push_aliases(
-    output: &mut Vec<Row>,
-    dex: &str,
-    kind: char,
-    symbol: String,
-    originals: Vec<String>,
-    source: Option<&str>,
-) {
-    if originals.is_empty() {
-        output.push(Row {
-            dex: dex.to_owned(),
-            kind,
-            symbol,
-            original: None,
-            source: source.map(str::to_owned),
-        });
-    } else {
-        for original in originals {
-            output.push(Row {
-                dex: dex.to_owned(),
-                kind,
-                symbol: symbol.clone(),
-                original: Some(original),
-                source: source.map(str::to_owned),
-            });
-        }
-    }
-}
-
-fn tsv(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
-pub(super) fn print_resources(
-    rows: &[Location],
-    json_output: bool,
-    aligned: bool,
-    show_original: bool,
-) -> Result<(), String> {
-    if json_output {
-        let values = rows
-            .iter()
-            .map(|row| {
-                json!({
-                    "archive": row.archive, "id": format!("0x{:08x}", row.id),
-                    "type": row.kind, "name": row.name, "original": row.original,
-                    "config": row.config, "value": row.value, "path": row.path,
-                    "usage": row.usage,
-                })
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string(&values).map_err(|error| error.to_string())?
-        );
-        return Ok(());
-    }
-    let mut headings = vec!["ARCHIVE", "ID", "TYPE", "NAME"];
-    if show_original {
-        headings.push("ORIGINAL");
-    }
-    headings.extend(["CONFIG", "VALUE", "PATH", "USAGE"]);
-
-    let fields = rows
-        .iter()
-        .map(|row| {
-            let mut fields = vec![
-                row.archive.clone(),
-                format!("0x{:08x}", row.id),
-                row.kind.clone(),
-                row.name.clone(),
-            ];
-            if show_original {
-                fields.push(row.original.clone().unwrap_or_else(|| "-".to_owned()));
-            }
-            fields.extend([
-                row.config.clone(),
-                non_empty(&row.value),
-                row.path.clone().unwrap_or_else(|| "-".to_owned()),
-                row.usage.clone().unwrap_or_else(|| "-".to_owned()),
-            ]);
-            fields
-        })
-        .collect::<Vec<_>>();
-    if aligned {
-        let widths = (0..headings.len())
-            .map(|index| {
-                fields
+impl Output {
+    pub(super) fn print_disassembled(
+        dex: &str,
+        class: &str,
+        result: &Disassembly,
+        output: Option<&Path>,
+    ) -> Result<(), String> {
+        let rendered = match result {
+            Disassembly::Instructions(methods) => {
+                let methods = methods
                     .iter()
-                    .map(|row| row[index].chars().count())
-                    .max()
-                    .unwrap_or(0)
-                    .max(headings[index].chars().count())
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            headings
+                    .map(|method| {
+                        let instructions = method
+                            .instructions
+                            .iter()
+                            .map(|instruction| {
+                                json!({
+                                    "dex_pc": instruction.dex_pc,
+                                    "instruction": instruction.instruction,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({"method": method.method, "instructions": instructions})
+                    })
+                    .collect::<Vec<_>>();
+
+                serde_json::to_string(&json!({"dex": dex, "class": class, "methods": methods}))
+                    .map_err(|error| error.to_string())?
+                    + "\n"
+            }
+            Disassembly::Smali(smali) => {
+                format!("# dex: {dex}\n\n{}\n", smali.trim_matches('\n'))
+            }
+        };
+
+        Self::write_output(&rendered, output)
+    }
+
+    pub(super) fn print_decompiled(
+        dex: &str,
+        class: &str,
+        source: &str,
+        json_output: bool,
+        output: Option<&Path>,
+    ) -> Result<(), String> {
+        if json_output {
+            let mut rendered = serde_json::to_string(&json!({
+                "dex": dex,
+                "class": class,
+                "source": source,
+            }))
+            .map_err(|error| error.to_string())?;
+
+            rendered.push('\n');
+
+            return Self::write_output(&rendered, output);
+        }
+
+        if let Some(path) = output {
+            let mut source = source.to_owned();
+
+            if !source.ends_with('\n') {
+                source.push('\n');
+            }
+
+            return fs::write(path, source).map_err(|error| format!("{}: {error}", path.display()));
+        }
+
+        println!("{}\n", source.trim_matches('\n'));
+
+        Ok(())
+    }
+
+    fn write_output(output: &str, path: Option<&Path>) -> Result<(), String> {
+        if let Some(path) = path {
+            return fs::write(path, output).map_err(|error| format!("{}: {error}", path.display()));
+        }
+
+        print!("{output}");
+
+        Ok(())
+    }
+
+    pub(super) fn print_output(
+        output: &[Symbol],
+        json: bool,
+        aligned: bool,
+        show_original: bool,
+    ) -> Result<(), String> {
+        if json {
+            let values = output
                 .iter()
-                .enumerate()
-                .map(|(index, heading)| format!("{heading:<width$}", width = widths[index]))
-                .collect::<Vec<_>>()
-                .join("  ")
-        );
-        for row in &fields {
+                .map(|row| {
+                    json!({
+                        "dex": row.dex, "type": row.kind.to_string(),
+                        "symbol": row.symbol, "original": row.original, "source": row.source,
+                    })
+                })
+                .collect::<Vec<_>>();
+
             println!(
                 "{}",
+                serde_json::to_string(&values).map_err(|error| error.to_string())?
+            );
+        } else {
+            let mut headings = vec!["DEX", "TYPE", "SYMBOL"];
+
+            if show_original {
+                headings.push("ORIGINAL");
+            }
+
+            headings.push("SOURCE");
+
+            let fields = output
+                .iter()
+                .map(|row| {
+                    let mut values =
+                        vec![row.dex.clone(), row.kind.to_string(), row.symbol.clone()];
+
+                    if show_original {
+                        values.push(row.original.clone().unwrap_or_default());
+                    }
+
+                    values.push(row.source.clone().unwrap_or_default());
+
+                    values
+                })
+                .collect::<Vec<_>>();
+
+            Self::print_table(&headings, &fields, aligned);
+        }
+
+        Ok(())
+    }
+
+    fn print_table(headings: &[&str], rows: &[Vec<String>], aligned: bool) {
+        let rows = rows
+            .iter()
+            .map(|row| {
                 row.iter()
+                    .map(|value| Self::tsv(&Self::non_empty(value)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        if aligned {
+            let widths = headings
+                .iter()
+                .enumerate()
+                .map(|(index, heading)| {
+                    rows.iter()
+                        .map(|row| row[index].chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .max(heading.chars().count())
+                })
+                .collect::<Vec<_>>();
+
+            println!(
+                "{}",
+                headings
+                    .iter()
                     .enumerate()
                     .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
                     .collect::<Vec<_>>()
                     .join("  ")
             );
-        }
-    } else {
-        println!("{}", headings.join("\t"));
-        for row in &fields {
-            println!(
-                "{}",
-                row.iter()
-                    .map(|field| tsv(field))
-                    .collect::<Vec<_>>()
-                    .join("\t")
-            );
+
+            for row in rows {
+                println!(
+                    "{}",
+                    row.iter()
+                        .enumerate()
+                        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                );
+            }
+        } else {
+            println!("{}", headings.join("\t"));
+
+            for row in rows {
+                println!("{}", row.join("\t"));
+            }
         }
     }
-    Ok(())
-}
 
-fn non_empty(value: &str) -> String {
-    if value.is_empty() { "-" } else { value }.to_owned()
+    fn tsv(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    }
+
+    pub(super) fn print_resources(
+        rows: &[Location],
+        json_output: bool,
+        aligned: bool,
+        show_original: bool,
+    ) -> Result<(), String> {
+        if json_output {
+            let values = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "archive": row.archive, "id": format!("0x{:08x}", row.id),
+                        "type": row.kind, "name": row.name, "original": row.original,
+                        "config": row.config, "value": row.value, "path": row.path,
+                        "usage": row.usage,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string(&values).map_err(|error| error.to_string())?
+            );
+
+            return Ok(());
+        }
+
+        let mut headings = vec!["ARCHIVE", "ID", "TYPE", "NAME"];
+
+        if show_original {
+            headings.push("ORIGINAL");
+        }
+
+        headings.extend(["CONFIG", "VALUE", "PATH", "USAGE"]);
+
+        let fields = rows
+            .iter()
+            .map(|row| {
+                let mut fields = vec![
+                    row.archive.clone(),
+                    format!("0x{:08x}", row.id),
+                    row.kind.clone(),
+                    row.name.clone(),
+                ];
+
+                if show_original {
+                    fields.push(row.original.clone().unwrap_or_else(|| "-".to_owned()));
+                }
+
+                fields.extend([
+                    row.config.clone(),
+                    Self::non_empty(&row.value),
+                    row.path.clone().unwrap_or_else(|| "-".to_owned()),
+                    row.usage.clone().unwrap_or_else(|| "-".to_owned()),
+                ]);
+
+                fields
+            })
+            .collect::<Vec<_>>();
+
+        Self::print_table(&headings, &fields, aligned);
+
+        Ok(())
+    }
+
+    fn non_empty(value: &str) -> String {
+        if value.is_empty() { "-" } else { value }.to_owned()
+    }
 }

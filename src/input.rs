@@ -1,9 +1,8 @@
-use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::fs::{self, File};
+use std::path::Path;
 
-use crc32fast::hash;
-use zip::ZipArchive;
+use crate::zip::Zip;
 
 pub(crate) struct FileSpec {
     source: Source,
@@ -13,7 +12,7 @@ pub(crate) struct FileSpec {
 
 enum Source {
     Direct(Vec<u8>),
-    Archive(PathBuf, String),
+    Archive(Zip<'static, File>, String),
 }
 
 impl FileSpec {
@@ -23,7 +22,7 @@ impl FileSpec {
 
             return Ok(Self {
                 size: bytes.len() as u64,
-                crc32: hash(&bytes),
+                crc32: crc32fast::hash(&bytes),
                 source: Source::Direct(bytes),
             });
         };
@@ -32,19 +31,11 @@ impl FileSpec {
             return Err("invalid ZIP entry".to_owned());
         }
 
-        let (size, crc32) = {
-            let file = fs::File::open(archive).map_err(|error| format!("{archive}: {error}"))?;
-            let mut zip =
-                ZipArchive::new(file).map_err(|error| format!("invalid ZIP {archive}: {error}"))?;
-            let file = zip
-                .by_name(entry)
-                .map_err(|error| format!("{archive}!{entry}: {error}"))?;
-
-            (file.size(), file.crc32())
-        };
+        let mut zip = Zip::open(Path::new(archive))?;
+        let (size, crc32) = zip.metadata(entry)?;
 
         Ok(Self {
-            source: Source::Archive(PathBuf::from(archive), entry.to_owned()),
+            source: Source::Archive(zip, entry.to_owned()),
             size,
             crc32,
         })
@@ -59,24 +50,54 @@ impl FileSpec {
     }
 
     pub(crate) fn into_bytes(self, spec: &str) -> Result<Vec<u8>, String> {
-        let (archive, entry) = match self.source {
+        let (mut zip, entry) = match self.source {
             Source::Direct(bytes) => return Ok(bytes),
             Source::Archive(archive, entry) => (archive, entry),
         };
 
-        let file = fs::File::open(&archive).map_err(|error| format!("{spec}: {error}"))?;
-        let mut zip =
-            ZipArchive::new(file).map_err(|error| format!("invalid ZIP {spec}: {error}"))?;
-        let mut file = zip
-            .by_name(&entry)
-            .map_err(|error| format!("{spec}: {error}"))?;
-        let capacity = usize::try_from(self.size)
-            .map_err(|_| format!("{spec}: ZIP entry is too large for this platform"))?;
-        let mut output = Vec::with_capacity(capacity);
+        zip.read_entry(&entry)
+            .map(Cow::into_owned)
+            .map_err(|error| format!("{spec}: {error}"))
+    }
+}
 
-        file.read_to_end(&mut output)
-            .map_err(|error| format!("{spec}: {error}"))?;
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-        Ok(output)
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    use super::FileSpec;
+
+    #[test]
+    fn reads_real_mapping_entries_and_metadata() {
+        for compression in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+            let id = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("apkq-entry-{id}.zip"));
+            let mut writer = ZipWriter::new(fs::File::create(&path).unwrap());
+            let bytes = b"com.example.Foo -> a:\n";
+            writer
+                .start_file(
+                    "maps/release.txt",
+                    SimpleFileOptions::default().compression_method(compression),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+            writer.finish().unwrap();
+            let spec = format!("{}!maps/release.txt", path.display());
+            let source = FileSpec::open(&spec).unwrap();
+            assert_eq!(source.size(), bytes.len() as u64);
+            assert_eq!(source.crc32(), crc32fast::hash(bytes));
+            assert_eq!(source.into_bytes(&spec).unwrap(), bytes);
+            assert!(FileSpec::open(&format!("{}!absent.txt", path.display())).is_err());
+            assert!(FileSpec::open(&format!("{}!inner.zip!mapping.txt", path.display())).is_err());
+            fs::remove_file(path).unwrap();
+        }
     }
 }

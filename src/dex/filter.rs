@@ -1,6 +1,7 @@
 use super::ReferenceFilter;
 use super::code::CodeReferences;
 use super::parse::{FieldId, MethodId};
+use super::query::Query;
 
 pub(super) struct ResolvedFilter {
     pub(super) strings: Vec<Vec<bool>>,
@@ -57,7 +58,7 @@ impl ResolvedFilter {
                 methods
                     .iter()
                     .map(|method| {
-                        super::method_matches(
+                        Query::method_matches(
                             query,
                             &method.class,
                             &method.name,

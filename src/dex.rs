@@ -1,9 +1,6 @@
-use std::borrow::Cow;
-use std::fs;
-use std::io::{Cursor, Read};
 use std::path::Path;
 
-use zip::{CompressionMethod, ZipArchive};
+use crate::archive::ApkArchive;
 
 mod code;
 mod decompile;
@@ -13,20 +10,14 @@ mod format;
 pub mod mapping;
 mod opcode;
 mod parse;
+pub mod query;
 
 use crate::java::{JavaField, JavaMethod, JavaType};
-pub use decompile::{DecompiledClass, decompile_apk};
+pub use decompile::DecompiledClass;
 pub use disassemble::{
-    DisassembledClass, DisassembledInstruction, DisassembledMethod, disassemble_apk,
+    DisassembleTarget, DisassembledInstruction, DisassembledMethod, Disassembly, DisassemblyFormat,
 };
 use mapping::Mapping;
-
-#[derive(Debug)]
-pub struct PreparedArchive {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) label: String,
-    pub(crate) nested: Vec<PreparedArchive>,
-}
 
 #[derive(Debug)]
 pub struct DexIndex {
@@ -70,267 +61,34 @@ pub struct FieldLocation {
     pub source_file: Option<String>,
 }
 
-pub fn method_matches(
-    query: &JavaMethod,
-    class: &str,
-    name: &str,
-    descriptor: &str,
-    mapping: Option<&Mapping>,
-) -> bool {
-    query.matches(class, name, descriptor)
-        || mapping.is_some_and(|mapping| {
-            mapping.original_class(class).is_some_and(|original| {
-                mapping
-                    .methods(class, name, descriptor)
-                    .any(|alias| query.matches(original, alias.name, alias.descriptor))
-            })
-        })
-}
-
-pub fn index_apk(apk: &Path, filter: Option<&ReferenceFilter<'_>>) -> Result<DexIndex, String> {
-    let prepared = prepare_apk(apk)?;
-    index_prepared(&prepared, filter)
-}
-
-pub fn prepare_apk(apk: &Path) -> Result<PreparedArchive, String> {
-    if !apk.is_file() {
-        return Err(format!("input is not a file: {}", apk.display()));
+impl DexIndex {
+    pub fn from_apk(apk: &Path, filter: Option<&ReferenceFilter<'_>>) -> Result<DexIndex, String> {
+        let prepared = ApkArchive::open(apk)?;
+        Self::from_archive(&prepared, filter, None)
     }
 
-    let bytes = fs::read(apk).map_err(|error| format!("{}: {error}", apk.display()))?;
+    pub fn from_archive(
+        prepared: &ApkArchive,
+        filter: Option<&ReferenceFilter<'_>>,
+        selected: Option<&str>,
+    ) -> Result<DexIndex, String> {
+        let mut index = DexIndex {
+            classes: Vec::new(),
+            locations: Vec::new(),
+            fields: Vec::new(),
+        };
 
-    prepare_archive(bytes)
-}
+        prepared.visit_dex(selected, &mut |label, bytes| {
+            parse::parse_dex(bytes, label, filter, &mut index)
+        })?;
 
-pub fn prepare_archive(bytes: Vec<u8>) -> Result<PreparedArchive, String> {
-    prepare_archive_at(bytes, "")
-}
-
-pub fn index_prepared(
-    prepared: &PreparedArchive,
-    filter: Option<&ReferenceFilter<'_>>,
-) -> Result<DexIndex, String> {
-    let mut index = DexIndex {
-        classes: Vec::new(),
-        locations: Vec::new(),
-        fields: Vec::new(),
-    };
-
-    index_archive(prepared, filter, &mut index)?;
-
-    Ok(index)
-}
-
-fn prepare_archive_at(bytes: Vec<u8>, label: &str) -> Result<PreparedArchive, String> {
-    let mut archive = open_archive(&bytes, label)?;
-    let mut nested = Vec::new();
-
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| format!("invalid ZIP entry in {label}: {error}"))?;
-        let name = entry
-            .name()
-            .map_err(|error| format!("invalid ZIP entry name in {label}: {error}"))?
-            .into_owned();
-
-        if is_nested_archive(&name) {
-            let nested_bytes = read_entry(&mut entry, &name, label)?;
-            let nested_label = join_label(label, &name);
-            let prepared = prepare_archive_at(nested_bytes, &nested_label)?;
-            nested.push(prepared);
-        }
-    }
-
-    Ok(PreparedArchive {
-        bytes,
-        label: label.to_owned(),
-        nested,
-    })
-}
-
-fn is_classes_dex(entry: &str) -> bool {
-    let name = entry.rsplit('/').next().unwrap_or(entry);
-    name == "classes.dex"
-        || name
-            .strip_prefix("classes")
-            .and_then(|name| name.strip_suffix(".dex"))
-            .is_some_and(|number| {
-                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-            })
-}
-
-fn is_nested_archive(entry: &str) -> bool {
-    entry.ends_with(".apk")
-}
-
-fn index_archive(
-    prepared: &PreparedArchive,
-    filter: Option<&ReferenceFilter<'_>>,
-    index: &mut DexIndex,
-) -> Result<(), String> {
-    let mut archive = open_archive(&prepared.bytes, &prepared.label)?;
-
-    for entry_index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(entry_index)
-            .map_err(|error| format!("invalid ZIP entry in {}: {error}", prepared.label))?;
-        let name = entry
-            .name()
-            .map_err(|error| format!("invalid ZIP entry name in {}: {error}", prepared.label))?
-            .into_owned();
-
-        if is_classes_dex(&name) {
-            let bytes = read_dex_entry(&prepared.bytes, &mut entry, &name, &prepared.label)?;
-            parse::parse_dex(bytes, &join_label(&prepared.label, &name), filter, index)?;
-        }
-    }
-
-    for nested in &prepared.nested {
-        index_archive(nested, filter, index)?;
-    }
-
-    Ok(())
-}
-
-fn open_archive<'a>(bytes: &'a [u8], label: &str) -> Result<ZipArchive<Cursor<&'a [u8]>>, String> {
-    ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
-        let label = if label.is_empty() { "input" } else { label };
-        format!("invalid ZIP archive {label}: {error}")
-    })
-}
-
-fn read_entry(reader: &mut impl Read, name: &str, archive: &str) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("failed to read {name} from {archive}: {error}"))?;
-
-    Ok(bytes)
-}
-
-fn read_dex_entry<'a>(
-    archive_bytes: &'a [u8],
-    entry: &mut zip::read::ZipFile<'_, Cursor<&'a [u8]>>,
-    name: &str,
-    archive: &str,
-) -> Result<Cow<'a, [u8]>, String> {
-    let size = entry.size();
-
-    if entry.compression() == CompressionMethod::Stored
-        && !entry.encrypted()
-        && entry.compressed_size() == size
-    {
-        let start = entry.data_start().ok_or("missing ZIP entry data offset")?;
-        let start = usize::try_from(start).map_err(|_| "ZIP entry offset is too large")?;
-        let length = usize::try_from(size).map_err(|_| "ZIP entry size is too large")?;
-        let end = start
-            .checked_add(length)
-            .ok_or("ZIP entry range overflow")?;
-        let bytes = archive_bytes
-            .get(start..end)
-            .ok_or("ZIP entry extends beyond archive")?;
-
-        if crc32fast::hash(bytes) != entry.crc32() {
-            return Err(format!("ZIP entry {name} in {archive} has an invalid CRC"));
-        }
-
-        Ok(Cow::Borrowed(bytes))
-    } else {
-        read_entry(entry, name, archive).map(Cow::Owned)
-    }
-}
-
-fn join_label(parent: &str, entry: &str) -> String {
-    if parent.is_empty() {
-        entry.to_owned()
-    } else {
-        format!("{parent}!{entry}")
+        Ok(index)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-    use std::io::{Cursor, Write};
-
-    use zip::write::SimpleFileOptions;
-    use zip::{CompressionMethod, ZipArchive, ZipWriter};
-
-    use super::{
-        code::CodeItem, code::CodeReferences, filter::ResolvedFilter, is_classes_dex,
-        prepare_archive, read_dex_entry,
-    };
-
-    #[test]
-    fn follows_apks_beyond_three_nested_levels() {
-        let mut bytes = ZipWriter::new(Cursor::new(Vec::new()))
-            .finish()
-            .unwrap()
-            .into_inner();
-
-        for _ in 0..4 {
-            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-            writer
-                .start_file("inner.apk", SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(&bytes).unwrap();
-            bytes = writer.finish().unwrap().into_inner();
-        }
-
-        let mut archive = prepare_archive(bytes).unwrap();
-        for _ in 0..4 {
-            assert_eq!(archive.nested.len(), 1);
-            archive = archive.nested.pop().unwrap();
-        }
-        assert!(archive.nested.is_empty());
-    }
-
-    #[test]
-    fn borrows_stored_dex_and_owns_deflated_dex() {
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, method) in [
-            ("classes.dex", CompressionMethod::Stored),
-            ("classes2.dex", CompressionMethod::Deflated),
-        ] {
-            writer
-                .start_file(
-                    name,
-                    SimpleFileOptions::default().compression_method(method),
-                )
-                .unwrap();
-            writer.write_all(b"dex\nexample").unwrap();
-        }
-
-        let bytes = writer.finish().unwrap().into_inner();
-        let mut archive = ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
-
-        for (index, borrowed) in [(0, true), (1, false)] {
-            let mut entry = archive.by_index(index).unwrap();
-            let data = read_dex_entry(&bytes, &mut entry, "classes.dex", "APK").unwrap();
-            assert_eq!(data.as_ref(), b"dex\nexample");
-            assert_eq!(matches!(data, Cow::Borrowed(_)), borrowed);
-        }
-
-        let mut corrupted = bytes.clone();
-        let start = {
-            let mut archive = ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
-            archive.by_index(0).unwrap().data_start().unwrap() as usize
-        };
-
-        corrupted[start] ^= 1;
-
-        let mut archive = ZipArchive::new(Cursor::new(corrupted.as_slice())).unwrap();
-        let mut entry = archive.by_index(0).unwrap();
-        assert!(read_dex_entry(&corrupted, &mut entry, "classes.dex", "APK").is_err());
-    }
-
-    #[test]
-    fn recognizes_dex_names() {
-        assert!(is_classes_dex("classes.dex"));
-        assert!(is_classes_dex("nested/classes12.dex"));
-        assert!(!is_classes_dex("other.dex"));
-    }
+    use super::{code::CodeItem, code::CodeReferences, filter::ResolvedFilter};
 
     #[test]
     fn reads_invoke_targets_without_call_site_details() {
