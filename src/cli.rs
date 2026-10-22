@@ -14,7 +14,7 @@ use regex::Regex;
 
 mod output;
 
-use output::{Row, print_output, print_resources, push_aliases};
+use output::{Row, print_disassembled, print_output, print_resources, push_aliases};
 
 #[derive(Parser)]
 #[command(
@@ -27,6 +27,7 @@ use output::{Row, print_output, print_resources, push_aliases};
   apkq app.apk r --type string --value 'Login failed'
   apkq app.apk r --type layout --uses-resource string/login_failed
   apkq app.apk d com.example.MainActivity
+  apkq app.apk x 'com.example.MainActivity#onCreate(android.os.Bundle):void'
   apkq app.apk --mapping 'mapping.zip!path/to/mapping.txt' --json m --name originalMethod
 
 Input: an APK; embedded APKs are searched recursively.
@@ -79,6 +80,28 @@ Examples:
         /// Write source or JSON output to this file instead of stdout
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Disassemble a class or method with DEX program counters
+    #[command(
+        visible_alias = "x",
+        after_help = r#"A dotted class name selects the whole class. METHOD uses Class#name or Class#name(parameters):returnType. An omitted signature is accepted only when it selects one method.
+DEX_PC is the instruction offset from the method's insns array, measured in 16-bit code units. Embedded APKs are searched recursively. Use --dex to select an exact nested DEX location.
+With --mapping, METHOD may use original or obfuscated names. Text appends # pc=0x… to each executable instruction. JSON contains dex, class, original, and methods with numeric instruction dex_pc values. Class annotations and static field initializers are not emitted.
+
+Examples:
+  apkq app.apk x 'com.example.MainActivity#onCreate(android.os.Bundle):void'
+  apkq app.apk x com.example.Client
+  apkq app.apk x 'com.example.Client#send'
+  apkq app.apk x 'com.example.Client#send(int):void' --dex classes2.dex
+  apkq app.apk --mapping mapping.txt --json x 'com.example.Client#send'"#
+    )]
+    Disassemble {
+        /// Class or method: Class, Class#name, or Class#name(parameters):returnType
+        #[arg(value_parser = parse_disassemble_target)]
+        method: String,
+        /// Exact DEX location, such as classes2.dex or assets/plugin.apk!classes.dex
+        #[arg(long)]
+        dex: Option<String>,
     },
     /// Find Android resources and references in compiled XML
     #[command(
@@ -247,7 +270,7 @@ Examples:
 impl Command {
     fn has_query(&self) -> bool {
         match self {
-            Self::Decompile { .. } => true,
+            Self::Decompile { .. } | Self::Disassemble { .. } => true,
             Self::Resources {
                 list,
                 kind,
@@ -306,6 +329,7 @@ impl Command {
     fn name(&self) -> &'static str {
         match self {
             Self::Decompile { .. } => "decompile",
+            Self::Disassemble { .. } => "disassemble",
             Self::Resources { .. } => "resources",
             Self::Classes { .. } => "classes",
             Self::Fields { .. } => "fields",
@@ -333,6 +357,123 @@ pub(super) fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if let Command::Disassemble {
+        method: query,
+        dex: selected_dex,
+    } = &cli.command
+    {
+        let started = Instant::now();
+        let mapping = cli.mapping.as_deref().map(mapping::load).transpose()?;
+        let index = dex::index_apk(&cli.input, None)?;
+        if !query.contains('#') {
+            let class: JavaClass = query.parse()?;
+            let matches = index
+                .classes
+                .iter()
+                .filter(|item| {
+                    selected_dex
+                        .as_deref()
+                        .is_none_or(|selected| item.dex == selected)
+                        && class_matches(&item.class, &class, mapping.as_ref())
+                })
+                .collect::<Vec<_>>();
+            let item = match matches.as_slice() {
+                [] => return Err(format!("class {class} was not found")),
+                [item] => *item,
+                items => {
+                    return Err(format!(
+                        "class {class} is ambiguous:\n{}\nselect one with --dex",
+                        items
+                            .iter()
+                            .map(|item| format!("  {}", item.dex))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
+                }
+            };
+            let result =
+                dex::disassemble_apk(&cli.input, &item.dex, &item.class, None, mapping.as_ref())?;
+            let actual = JavaClass::from_descriptor(&item.class)?.to_string();
+            let original = mapping
+                .as_ref()
+                .and_then(|mapping| mapping.original_class(&item.class))
+                .map(JavaClass::from_descriptor)
+                .transpose()?
+                .map(|class| class.to_string());
+
+            print_disassembled(&item.dex, &actual, original.as_deref(), &result, cli.json)?;
+            eprintln!("disassembled in {:.3}s", started.elapsed().as_secs_f64());
+
+            return Ok(());
+        }
+
+        let query: JavaMethod = query.parse()?;
+        let matches = index
+            .locations
+            .iter()
+            .filter(|method| {
+                selected_dex
+                    .as_deref()
+                    .is_none_or(|selected| method.dex == selected)
+                    && dex::method_matches(
+                        &query,
+                        &method.class,
+                        &method.method,
+                        &method.descriptor,
+                        mapping.as_ref(),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let method = match matches.as_slice() {
+            [] if selected_dex.is_some() => {
+                return Err(format!(
+                    "method {query} was not found in DEX {}",
+                    selected_dex.as_deref().unwrap_or_default()
+                ));
+            }
+            [] => return Err(format!("method {query} was not found")),
+            [method] => *method,
+            matches => {
+                let locations = matches
+                    .iter()
+                    .map(|method| {
+                        JavaMethod::from_descriptor(
+                            &method.class,
+                            &method.method,
+                            &method.descriptor,
+                        )
+                        .map(|symbol| format!("  {}  {symbol}", method.dex))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("\n");
+
+                return Err(format!(
+                    "method {query} is ambiguous:\n{locations}\nuse a full signature or select one with --dex"
+                ));
+            }
+        };
+
+        let result = dex::disassemble_apk(
+            &cli.input,
+            &method.dex,
+            &method.class,
+            Some((&method.method, &method.descriptor)),
+            mapping.as_ref(),
+        )?;
+        let actual = JavaClass::from_descriptor(&method.class)?.to_string();
+        let original = mapping
+            .as_ref()
+            .and_then(|mapping| mapping.original_class(&method.class))
+            .map(JavaClass::from_descriptor)
+            .transpose()?
+            .map(|class| class.to_string());
+
+        print_disassembled(&method.dex, &actual, original.as_deref(), &result, cli.json)?;
+        eprintln!("disassembled in {:.3}s", started.elapsed().as_secs_f64());
+
+        return Ok(());
+    }
+
     if let Command::Decompile {
         class,
         dex: selected_dex,
@@ -606,7 +747,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
             }
         }
-        Command::Resources { .. } | Command::Decompile { .. } => unreachable!(),
+        Command::Resources { .. } | Command::Decompile { .. } | Command::Disassemble { .. } => {
+            unreachable!()
+        }
     }
 
     output.sort();
@@ -768,6 +911,16 @@ fn non_empty(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_disassemble_target(value: &str) -> Result<String, String> {
+    if value.contains('#') {
+        value.parse::<JavaMethod>()?;
+    } else {
+        value.parse::<JavaClass>()?;
+    }
+
+    Ok(value.to_owned())
+}
+
 fn parse_decompile_class(value: &str) -> Result<JavaClass, String> {
     if value.starts_with('L') && value.ends_with(';') {
         JavaClass::from_descriptor(value)
@@ -810,6 +963,28 @@ mod tests {
                 "assets/plugin.apk!classes.dex",
                 "-o",
                 "MainActivity.java"
+            ])
+            .is_ok()
+        );
+        assert!(matches!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "x",
+                "com.example.MainActivity#onCreate(android.os.Bundle):void"
+            ])
+            .unwrap()
+            .command,
+            Command::Disassemble { .. }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "apkq",
+                "app.apk",
+                "disassemble",
+                "com.example.Client#send",
+                "--dex",
+                "classes2.dex"
             ])
             .is_ok()
         );
@@ -1024,6 +1199,20 @@ mod tests {
         assert!(method_name_regex_matches(
             &method,
             &Regex::new("^originalMethod$").unwrap(),
+            Some(&mapping)
+        ));
+        assert!(apkq::dex::method_matches(
+            &"com.example.Type#originalMethod():void".parse().unwrap(),
+            &method.class,
+            &method.method,
+            &method.descriptor,
+            Some(&mapping)
+        ));
+        assert!(apkq::dex::method_matches(
+            &"a.b#d():void".parse().unwrap(),
+            &method.class,
+            &method.method,
+            &method.descriptor,
             Some(&mapping)
         ));
     }

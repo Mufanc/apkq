@@ -35,11 +35,15 @@ apkq app.apk r --type layout --uses-resource string/login_failed
 apkq app.apk --json r --type layout --uses-resource 0x7f0a0012
 apkq app.apk d com.example.MainActivity
 apkq app.apk d com.example.MainActivity -o MainActivity.java
+apkq app.apk x 'com.example.MainActivity#onCreate(android.os.Bundle):void'
+apkq app.apk --json x 'com.example.Client#send(int):void'
 ```
 
-`c`, `f`, `m`, `r`, and `d` are aliases for `classes`, `fields`, `methods`, `resources`, and `decompile`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
+`c`, `f`, `m`, `r`, `d`, and `x` are aliases for `classes`, `fields`, `methods`, `resources`, `decompile`, and `disassemble`. Pass an APK as input. Embedded APKs are followed recursively, including their separate resource tables.
 
 `decompile` accepts a dotted class name or DEX descriptor and writes Java-like source to stdout. Use `-o` to write it to a file. If the same class occurs in multiple DEX files, use `--dex` with the exact nested DEX location. `--mapping` lets the command locate a class by its original name; generated source retains the names emitted by the decompiler.
+
+`disassemble` accepts a dotted class name, `Class#name`, or `Class#name(parameters):returnType`. It emits the class or method as smali, with `# pc=0x…` appended to each executable instruction. `dex_pc` is the offset from the method's instruction array in 16-bit code units. An omitted signature must select exactly one overload. Use `--dex` when definitions in multiple DEX files match. JSON output contains `dex`, `class`, `original`, and a `methods` array; each method contains its symbol, original symbol, and instructions with numeric `dex_pc` values for debugger tooling. Class output includes declarations and fields; annotations and static field initializers are not currently emitted.
 
 Running a subcommand without a query prints its help. Use `--list` to return every item; `--list` cannot be combined with query filters. `--name` and `--name-regex` are alternatives. Resource `--value` and `--value-regex` are alternatives too.
 
@@ -60,6 +64,7 @@ apkq app.apk --mapping 'mappings.zip!release/mapping.txt' --json m --name origin
 - Resource reference queries match direct references in resource table values and compiled XML attributes.
 - Resource value queries support Rust regular expressions.
 - `decompile` emits one matched class as Java-like source.
+- `disassemble` emits one matched method as smali instructions with DEX program counters.
 
 ## Code layout
 

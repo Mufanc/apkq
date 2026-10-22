@@ -7,6 +7,7 @@ use zip::{CompressionMethod, ZipArchive};
 
 mod code;
 mod decompile;
+mod disassemble;
 mod filter;
 mod format;
 pub mod mapping;
@@ -15,6 +16,9 @@ mod parse;
 
 use crate::java::{JavaField, JavaMethod, JavaType};
 pub use decompile::{DecompiledClass, decompile_apk};
+pub use disassemble::{
+    DisassembledClass, DisassembledInstruction, DisassembledMethod, disassemble_apk,
+};
 use mapping::Mapping;
 
 #[derive(Debug)]
@@ -64,6 +68,23 @@ pub struct FieldLocation {
     pub field: String,
     pub descriptor: String,
     pub source_file: Option<String>,
+}
+
+pub fn method_matches(
+    query: &JavaMethod,
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    mapping: Option<&Mapping>,
+) -> bool {
+    query.matches(class, name, descriptor)
+        || mapping.is_some_and(|mapping| {
+            mapping.original_class(class).is_some_and(|original| {
+                mapping
+                    .methods(class, name, descriptor)
+                    .any(|alias| query.matches(original, alias.name, alias.descriptor))
+            })
+        })
 }
 
 pub fn index_apk(apk: &Path, filter: Option<&ReferenceFilter<'_>>) -> Result<DexIndex, String> {

@@ -57,16 +57,13 @@ impl ResolvedFilter {
                 methods
                     .iter()
                     .map(|method| {
-                        query.matches(&method.class, &method.name, &method.descriptor)
-                            || filter.mapping.is_some_and(|mapping| {
-                                mapping.original_class(&method.class).is_some_and(|class| {
-                                    mapping
-                                        .methods(&method.class, &method.name, &method.descriptor)
-                                        .any(|alias| {
-                                            query.matches(class, alias.name, alias.descriptor)
-                                        })
-                                })
-                            })
+                        super::method_matches(
+                            query,
+                            &method.class,
+                            &method.name,
+                            &method.descriptor,
+                            filter.mapping,
+                        )
                     })
                     .collect()
             })

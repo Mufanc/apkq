@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use apkq::dex::DisassembledClass;
 use apkq::resource::Location;
 use serde_json::json;
 
@@ -11,6 +12,44 @@ pub(super) struct Row {
     pub(super) symbol: String,
     pub(super) original: Option<String>,
     pub(super) source: Option<String>,
+}
+
+pub(super) fn print_disassembled(
+    dex: &str,
+    class: &str,
+    original: Option<&str>,
+    result: &DisassembledClass,
+    json_output: bool,
+) -> Result<(), String> {
+    if json_output {
+        let methods = result.methods.iter().map(|method| {
+            let instructions = method.instructions.iter().map(|instruction| json!({
+                "dex_pc": instruction.dex_pc,
+                "instruction": instruction.instruction,
+            })).collect::<Vec<_>>();
+            json!({"method": method.method, "original": method.original, "instructions": instructions})
+        }).collect::<Vec<_>>();
+
+        println!(
+            "{}",
+            serde_json::to_string(
+                &json!({"dex": dex, "class": class, "original": original, "methods": methods})
+            )
+            .map_err(|error| error.to_string())?
+        );
+
+        return Ok(());
+    }
+
+    println!("# dex: {dex}");
+
+    if let Some(original) = original {
+        println!("# original: {original}");
+    }
+
+    println!("\n{}", result.smali.trim_matches('\n'));
+
+    Ok(())
 }
 
 pub(super) fn print_decompiled(
